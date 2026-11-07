@@ -1,0 +1,19 @@
+# The Job live-ingestion renders: named after the spec's hash, so it runs once per change; no retry (backoffLimit 0),
+# so that a failure fails the Flux layer waiting on it.
+apiVersion: batch/v1
+kind: Job
+metadata: {name: JOB_NAME, namespace: redpanda}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 900
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: topicsync
+          image: TOPICSYNC_IMAGE
+          imagePullPolicy: Never
+          args: [ARGS, --spec, /etc/topicsync/topics.json, --brokers, "redpanda-0.redpanda.redpanda.svc.cluster.local:9092", --cluster-label, e2e]
+          volumeMounts: [{name: spec, mountPath: /etc/topicsync, readOnly: true}]
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, runAsNonRoot: true, capabilities: {drop: [ALL]}}
+      volumes: [{name: spec, configMap: {name: CONFIGMAP}}]

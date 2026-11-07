@@ -1,0 +1,44 @@
+# Topic resources as live-ingestion renders them for the Redpanda operator.
+apiVersion: cluster.redpanda.com/v1alpha2
+kind: Topic
+metadata: {name: ohlcv.v1.e2e.1m, namespace: redpanda}
+spec: &spec
+  overwriteTopicName: ohlcv.v1.e2e.1m
+  interval: 15m
+  partitions: 1
+  replicationFactor: 1
+  additionalConfig: {cleanup.policy: "delete", retention.bytes: "40316198", segment.bytes: "16777216"}
+  cluster: {staticConfiguration: {kafka: {brokers: ["redpanda-0.redpanda.redpanda.svc.cluster.local:9092"]}}}
+---
+apiVersion: cluster.redpanda.com/v1alpha2
+kind: Topic
+metadata: {name: ohlcv.v1.e2e.1h, namespace: redpanda}
+spec:
+  overwriteTopicName: ohlcv.v1.e2e.1h
+  interval: 15m
+  partitions: 1
+  replicationFactor: 1
+  additionalConfig: {cleanup.policy: "delete", retention.bytes: "40316199", segment.bytes: "16777216"}
+  cluster: {staticConfiguration: {kafka: {brokers: ["redpanda-0.redpanda.redpanda.svc.cluster.local:9092"]}}}
+---
+apiVersion: cluster.redpanda.com/v1alpha2
+kind: Topic
+metadata: {name: raw.trades.e2e, namespace: redpanda}
+spec:
+  overwriteTopicName: raw.trades.e2e
+  interval: 15m
+  partitions: 3
+  replicationFactor: 1
+  additionalConfig: {cleanup.policy: "delete", retention.bytes: "1879048192"}
+  cluster: {staticConfiguration: {kafka: {brokers: ["redpanda-0.redpanda.redpanda.svc.cluster.local:9092"]}}}
+---
+# the negative control: deleting it with the operator running deletes the Kafka topic
+apiVersion: cluster.redpanda.com/v1alpha2
+kind: Topic
+metadata: {name: e2e.deleteme, namespace: redpanda}
+spec:
+  overwriteTopicName: e2e.deleteme
+  interval: 15m
+  partitions: 1
+  replicationFactor: 1
+  cluster: {staticConfiguration: {kafka: {brokers: ["redpanda-0.redpanda.redpanda.svc.cluster.local:9092"]}}}
