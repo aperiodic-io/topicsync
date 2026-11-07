@@ -40,6 +40,10 @@ type Options struct {
 	Logger *slog.Logger
 	// Sleep waits; tests replace it. It returns ctx's error if ctx ends first.
 	Sleep func(ctx context.Context, d time.Duration) error
+	// VerifyAttempts is how many times the verifying plan is tried, VerifyPause apart, before a run counts as not
+	// converged: a broker that has not caught up with an alter yet can report the old value for a moment.
+	VerifyAttempts int
+	VerifyPause    time.Duration
 
 	stats *Stats
 }
@@ -57,6 +61,7 @@ func DefaultOptions() Options {
 	return Options{
 		BatchSize: 20, BatchPause: 2 * time.Second, LeaderTimeout: 2 * time.Minute, LeaderPoll: 500 * time.Millisecond,
 		Retries: 5, RetryBackoff: 500 * time.Millisecond, Logger: slog.Default(), Sleep: sleep,
+		VerifyAttempts: 5, VerifyPause: 5 * time.Second,
 	}
 }
 
@@ -250,9 +255,9 @@ func (o Options) retry(ctx context.Context, a plan.Action, fn func() error) (boo
 }
 
 func (o Options) waitLeaders(ctx context.Context, c cluster.Cluster, actions []plan.Action) error {
-	topics := make([]string, len(actions))
-	for i, a := range actions {
-		topics[i] = a.Topic
+	topics := make(map[string]int32, len(actions))
+	for _, a := range actions {
+		topics[a.Topic] = max(a.Partitions, a.ToPartitions) // a create's count, or a partition increase's target
 	}
 	start := time.Now()
 	if o.stats != nil {
@@ -302,6 +307,12 @@ func withDefaults(o Options) Options {
 	if o.Sleep == nil {
 		o.Sleep = sleep
 	}
+	if o.VerifyAttempts <= 0 {
+		o.VerifyAttempts = d.VerifyAttempts
+	}
+	if o.VerifyPause <= 0 {
+		o.VerifyPause = d.VerifyPause
+	}
 	return o
 }
 
@@ -334,11 +345,11 @@ var ErrNotConverged = errors.New("the cluster still differs from the desired sta
 
 // observe reads the cluster, retrying retriable failures: a request that reached a stalled broker is tried again
 // (the client picks a broker per request).
-func (o Options) observe(ctx context.Context, c cluster.Cluster) (cluster.State, error) {
+func (o Options) observe(ctx context.Context, c cluster.Cluster, configsOf []string) (cluster.State, error) {
 	var state cluster.State
 	_, err := o.retry(ctx, plan.Action{Kind: "observe"}, func() error {
 		var err error
-		state, err = c.Observe(ctx)
+		state, err = c.Observe(ctx, configsOf)
 		return err
 	})
 	return state, err
@@ -349,7 +360,7 @@ func Run(ctx context.Context, c cluster.Cluster, d *spec.Desired, po plan.Option
 	eo = withDefaults(eo)
 	eo.stats = &out.Stats
 	t := time.Now()
-	state, err := eo.observe(ctx, c)
+	state, err := eo.observe(ctx, c, d.Names())
 	out.ObserveDuration = time.Since(t)
 	if err != nil {
 		out.Stage = StageObserve
@@ -369,20 +380,31 @@ func Run(ctx context.Context, c cluster.Cluster, d *spec.Desired, po plan.Option
 	out.Result = Execute(ctx, c, p, eo)
 	out.ExecuteDuration = time.Since(t)
 	t = time.Now()
-	state, err = eo.observe(ctx, c)
-	out.VerifyDuration = time.Since(t)
-	if err != nil {
-		out.Stage = StageVerify
-		return out, errors.Join(out.Result.Err(), fmt.Errorf("observing the cluster after applying: %w", err))
-	}
 	// the verification never prunes: a delete that failed is in Result already
 	verify := po
 	verify.Prune = false
-	final, err := plan.Compute(d, state, verify)
-	if err != nil {
-		out.Stage = StageVerify
-		return out, errors.Join(out.Result.Err(), fmt.Errorf("planning after applying: %w", err))
+	var final *plan.Plan
+	for attempt := 1; ; attempt++ {
+		state, err = eo.observe(ctx, c, d.Names())
+		if err != nil {
+			out.VerifyDuration = time.Since(t)
+			out.Stage = StageVerify
+			return out, errors.Join(out.Result.Err(), fmt.Errorf("observing the cluster after applying: %w", err))
+		}
+		final, err = plan.Compute(d, state, verify)
+		if err != nil {
+			out.VerifyDuration = time.Since(t)
+			out.Stage = StageVerify
+			return out, errors.Join(out.Result.Err(), fmt.Errorf("planning after applying: %w", err))
+		}
+		if final.Empty() || attempt >= eo.VerifyAttempts || len(out.Result.Failures) > 0 {
+			break
+		}
+		if err := eo.Sleep(ctx, eo.VerifyPause); err != nil {
+			break
+		}
 	}
+	out.VerifyDuration = time.Since(t)
 	out.Final = final
 	if rerr := out.Result.Err(); rerr != nil {
 		out.Stage = StageExecute

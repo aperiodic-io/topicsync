@@ -107,10 +107,11 @@ func StartWith(t testing.TB, flavor, image, volume string) *Cluster {
 	default:
 		t.Fatalf("unknown flavor %q", flavor)
 	}
-	docker(t, args...)
+	// cleanup first: a container that is created but fails to start must not leak
 	c.Containers = append(c.Containers, name)
-	c.Addrs = append(c.Addrs, fmt.Sprintf("127.0.0.1:%d", port))
 	t.Cleanup(c.remove)
+	docker(t, args...)
+	c.Addrs = append(c.Addrs, fmt.Sprintf("127.0.0.1:%d", port))
 	c.WaitReady(1)
 	return c
 }
@@ -133,8 +134,8 @@ func StartRedpandaCluster(t testing.TB, image string) *Cluster {
 			"--kafka-addr", fmt.Sprintf("PLAINTEXT://0.0.0.0:%d", port), "--advertise-kafka-addr", fmt.Sprintf("PLAINTEXT://127.0.0.1:%d", port),
 			"--rpc-addr", "0.0.0.0:33145", "--advertise-rpc-addr", name + ":33145", "--seeds", names[0] + ":33145",
 			"--check=false", "--set", "redpanda.auto_create_topics_enabled=false"}
+		c.Containers = append(c.Containers, name) // removed by the cleanup registered above, even if it fails to start
 		docker(t, args...)
-		c.Containers = append(c.Containers, name)
 		c.Addrs = append(c.Addrs, fmt.Sprintf("127.0.0.1:%d", port))
 	}
 	c.WaitReady(3)
@@ -260,7 +261,7 @@ func Volume(t testing.TB) string {
 // RemoveContainers removes the cluster's containers now, keeping named volumes (for an upgrade test's restart).
 func (c *Cluster) RemoveContainers() {
 	for _, n := range c.Containers {
-		docker(c.t, "rm", "-f", n)
+		docker(c.t, "rm", "-f", "-v", n) // -v drops anonymous volumes only; the named data volume stays
 	}
 	c.Containers = nil
 }

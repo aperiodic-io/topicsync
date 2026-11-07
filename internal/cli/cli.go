@@ -191,12 +191,15 @@ func (c *common) kafkaConfig(env Env) (kafka.Config, error) {
 		TLSCAFile: c.tlsCA, TLSServerName: c.tlsServerName, TLSInsecureSkipVerify: c.tlsInsecure,
 		SASLMechanism: strings.ToUpper(c.saslMechanism), SASLUser: c.saslUser,
 	}
+	if cfg.SASLMechanism == "" && (c.saslUser != "" || c.saslPasswordFile != "") {
+		return kafka.Config{}, errors.New("a SASL user or password without --sasl-mechanism: say which mechanism, or the connection would be unauthenticated")
+	}
 	if cfg.SASLMechanism != "" {
 		pw := env.Getenv("TOPICSYNC_SASL_PASSWORD")
 		if c.saslPasswordFile != "" {
 			b, err := os.ReadFile(c.saslPasswordFile)
 			if err != nil {
-				return kafka.Config{}, fmt.Errorf("reading --sasl-password-file: %w", err)
+				return kafka.Config{}, &configError{fmt.Errorf("reading --sasl-password-file: %w", err)}
 			}
 			pw = strings.TrimRight(string(b), "\r\n")
 		}
@@ -208,6 +211,11 @@ func (c *common) kafkaConfig(env Env) (kafka.Config, error) {
 	return cfg, nil
 }
 
+// configError is a failure of the environment (a Secret not mounted), not of the command line: exit 1, reported.
+type configError struct{ error }
+
+func (e *configError) Unwrap() error { return e.error }
+
 func runOnline(ctx context.Context, cmd string, args []string, env Env) int {
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	fs.SetOutput(env.Stderr)
@@ -218,10 +226,11 @@ func runOnline(ctx context.Context, cmd string, args []string, env Env) int {
 	var (
 		prune, allowEmpty, dryRun, detailed bool
 		topic, confirm                      string
-		minIdle                             time.Duration
+		minIdle, writeCheck                 time.Duration
 	)
 	if cmd == "plan" || cmd == "apply" {
-		fs.BoolVar(&prune, "prune", false, "delete prunable topics (the file must enable prune too); plan shows them as deletes")
+		fs.BoolVar(&prune, "prune", false, "delete topics the file no longer lists (default false: they are never deleted). Needs the file's "+
+			"prune.enabled too, and deletes only names matching its prune patterns, within the caps below")
 		fs.IntVar(&po.PruneMaxDeletes, "prune-max-deletes", po.PruneMaxDeletes, "refuse a run that would prune more topics than this")
 		fs.Float64Var(&po.PruneMaxFraction, "prune-max-fraction", po.PruneMaxFraction,
 			"refuse a run that would prune more than this share of the topics matching a prune pattern")
@@ -241,6 +250,7 @@ func runOnline(ctx context.Context, cmd string, args []string, env Env) int {
 		fs.StringVar(&topic, "topic", "", "the topic to retire (required)")
 		fs.StringVar(&confirm, "confirm", "", "repeat the topic's name to delete it; without it, only the checks run")
 		fs.DurationVar(&minIdle, "min-idle", time.Hour, "how old the topic's newest record must be")
+		fs.DurationVar(&writeCheck, "write-check", 30*time.Second, "how long the topic's end offsets must stay still (record timestamps alone can lie)")
 	}
 	if err := fs.Parse(args); err != nil {
 		return ExitUsage
@@ -270,17 +280,30 @@ func runOnline(ctx context.Context, cmd string, args []string, env Env) int {
 		fmt.Fprintln(env.Stderr, err)
 		return ExitUsage
 	}
-	kc, err := c.kafkaConfig(env)
-	if err != nil {
-		fmt.Fprintln(env.Stderr, err)
-		return ExitUsage
-	}
 	start := env.Now()
-	run := metrics.Run{Cluster: c.clusterLabel, Mode: cmd, Version: Version, Start: start}
+	mode := cmd
+	if dryRun {
+		mode = "dry-run" // not an apply: a dry run must not satisfy "no successful apply" alerts
+	}
+	run := metrics.Run{Cluster: c.clusterLabel, Mode: mode, Version: Version, Start: start}
 	report := func(code int) int {
 		run.Duration = env.Now().Sub(start)
 		c.reportMetrics(ctx, run, log)
 		return code
+	}
+	kc, err := c.kafkaConfig(env)
+	var ce *configError
+	switch {
+	case errors.As(err, &ce):
+		log.Error("configuration", "error", err)
+		run.FailedStage = "config"
+		return report(ExitFailure)
+	case err != nil:
+		fmt.Fprintln(env.Stderr, err)
+		return ExitUsage
+	}
+	if kc.SASLMechanism == "PLAIN" && !kc.TLS {
+		log.Warn("SASL PLAIN without TLS sends the password in clear text")
 	}
 	d, err := spec.Load(c.spec)
 	if err != nil {
@@ -314,7 +337,7 @@ func runOnline(ctx context.Context, cmd string, args []string, env Env) int {
 	case "plan", "apply":
 		code = c.planOrApply(ctx, cmd, cl, d, po, eo, dryRun, detailed, log, env, &run)
 	case "retire":
-		code = c.retire(ctx, cl, d, topic, confirm, minIdle, log, env, &run)
+		code = c.retire(ctx, cl, d, topic, confirm, minIdle, writeCheck, log, env, &run)
 	}
 	return report(code)
 }
@@ -364,9 +387,9 @@ func (c *common) printPlan(w io.Writer, p *plan.Plan) {
 	fmt.Fprint(w, p.Text())
 }
 
-func (c *common) retire(ctx context.Context, cl cluster.Cluster, d *spec.Desired, topic, confirm string, minIdle time.Duration,
+func (c *common) retire(ctx context.Context, cl cluster.Cluster, d *spec.Desired, topic, confirm string, minIdle, writeCheck time.Duration,
 	log *slog.Logger, env Env, run *metrics.Run) int {
-	rep, err := retire.Retire(ctx, cl, d, topic, retire.Options{Confirm: confirm, MinIdle: minIdle, Now: env.Now})
+	rep, err := retire.Retire(ctx, cl, d, topic, retire.Options{Confirm: confirm, MinIdle: minIdle, WriteCheck: writeCheck, Now: env.Now, Sleep: env.Sleep})
 	for _, g := range rep.Groups {
 		fmt.Fprintf(env.Stdout, "group %s: state %s, %d active member(s), lag %d, committed %v\n", g.Group, g.State, g.ActiveMembers, g.Lag, g.Committed)
 	}

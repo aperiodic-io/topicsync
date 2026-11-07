@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -32,7 +33,7 @@ func desired(t *testing.T, prune bool, topics ...spec.Topic) *spec.Desired {
 
 func observe(t *testing.T, f *cluster.Fake) cluster.State {
 	t.Helper()
-	s, err := f.Observe(context.Background())
+	s, err := f.Observe(context.Background(), f.Names())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,15 +93,41 @@ func TestAValueEqualToADefaultIsNotSetAgain(t *testing.T) {
 	}
 }
 
-func TestAKeyTheBrokerDoesNotReportIsSet(t *testing.T) {
+// A key the broker accepts but never reports (Redpanda: unclean.leader.election.enable) would be set on every run and
+// never converge: it is a warning, not an action.
+func TestAKeyTheBrokerDoesNotReportIsAWarning(t *testing.T) {
 	f := cluster.NewFake(nil)
 	f.Put("a", 1, 3, nil)
 	p, err := Compute(desired(t, false, spec.Topic{Name: "a"}), observe(t, f), DefaultOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if kinds(p) != "alter_configs:a" || p.Actions[0].Changes[0].FromSource != "absent" {
-		t.Fatalf("plan %+v", p.Actions)
+	if !p.Empty() || p.WarningCount(UnreportedConfig) != 1 {
+		t.Fatalf("plan %s warnings %+v", kinds(p), p.Warnings)
+	}
+}
+
+// What brokers report back in their own form converges: booleans in another case, list values in another order.
+func TestNormalizedValuesConverge(t *testing.T) {
+	f := cluster.NewFake(map[string]string{"cleanup.policy": "delete", "unclean.leader.election.enable": "false", "x": "1"})
+	d := desired(t, false, spec.Topic{Name: "a", Configs: map[string]string{"cleanup.policy": "delete,compact", "unclean.leader.election.enable": "False"}})
+	state := observe(t, f)
+	p, _ := Compute(d, state, DefaultOptions())
+	applyToFake(t, f, p) // creates it; the fake stores "compact,delete" and "false", as brokers do
+	again, err := Compute(d, observe(t, f), DefaultOptions())
+	if err != nil || !again.Empty() {
+		t.Fatalf("normalized values plan again: %s %v", kinds(again), err)
+	}
+	for _, c := range []struct {
+		a, b string
+		same bool
+	}{
+		{"delete,compact", "compact,delete", true}, {"compact, delete", "delete,compact", true}, {"False", "false", true},
+		{"TRUE", "true", true}, {"delete", "compact", false}, {"1", "01", false}, {"delete,compact", "delete", false},
+	} {
+		if SameValue(c.a, c.b) != c.same {
+			t.Errorf("SameValue(%q, %q) = %v", c.a, c.b, !c.same)
+		}
 	}
 }
 
@@ -289,7 +316,9 @@ func TestPlanThenApplyConverges(t *testing.T) {
 	keys := []string{"cleanup.policy", "retention.ms", "retention.bytes", "segment.bytes", "max.message.bytes"}
 	vals := []string{"1", "2", "delete", "compact", "1000"}
 	for iter := range 2000 {
-		f := cluster.NewFake(map[string]string{"cleanup.policy": "delete", "retention.ms": "604800000"})
+		// as a broker does, every topic reports every key (a default when not set)
+		f := cluster.NewFake(map[string]string{"cleanup.policy": "delete", "retention.ms": "604800000", "retention.bytes": "-1",
+			"segment.bytes": "1073741824", "max.message.bytes": "1048588"})
 		names := []string{"m.a", "m.b", "m.c", "m.d", "x.a", "x.b", "_m.int", "m.e", "m.f", "m.g"}
 		// a random cluster
 		for _, n := range names {
@@ -419,5 +448,95 @@ func TestUnmanagedCountsUnlistedTopicsButNotInternalOrProtected(t *testing.T) {
 	p, err := Compute(desired(t, false, spec.Topic{Name: "m.listed"}), observe(t, f), DefaultOptions())
 	if err != nil || p.Unmanaged != 2 {
 		t.Fatalf("unmanaged %d err %v", p.Unmanaged, err)
+	}
+}
+
+// Property: with random prune patterns (including a top-level "|" that must not escape the anchors) and random caps,
+// a run deletes only what an independent oracle allows (a whole-name match of a pattern, not listed, not internal,
+// not protected), never more than the caps, and refuses rather than exceed them.
+func TestPruneNeverExceedsWhatTheOracleAllows(t *testing.T) {
+	r := rand.New(rand.NewPCG(3, 4))
+	patterns := []string{`^m\..*$`, `^m\.[a-c]$`, `^m\.a|x\.b$`, `^x\..*$`}
+	names := []string{"m.a", "m.b", "m.c", "m.d", "m.a-prod", "x.a", "x.b", "prod.x.b", "_m.a", "brrrrr.leases"}
+	oracle := func(p []string, listed map[string]bool, name string) bool {
+		if strings.HasPrefix(name, "_") || name == "brrrrr.leases" || listed[name] {
+			return false
+		}
+		for _, pat := range p {
+			if regexp.MustCompile(`^(?:` + pat + `)$`).MatchString(name) {
+				return true
+			}
+		}
+		return false
+	}
+	for iter := range 3000 {
+		f := cluster.NewFake(map[string]string{"cleanup.policy": "delete"})
+		for _, n := range names {
+			if r.IntN(3) > 0 {
+				f.Put(n, 1, 3, nil)
+			}
+		}
+		var pats []string
+		for _, p := range patterns {
+			if r.IntN(2) == 0 {
+				pats = append(pats, p)
+			}
+		}
+		if len(pats) == 0 {
+			pats = patterns[:1]
+		}
+		listed := map[string]bool{}
+		var topics []spec.Topic
+		for _, n := range names[:8] {
+			if r.IntN(2) == 0 && !strings.HasPrefix(n, "_") {
+				listed[n] = true
+				topics = append(topics, spec.Topic{Name: n})
+			}
+		}
+		if len(topics) == 0 {
+			listed["m.a"] = true
+			topics = append(topics, spec.Topic{Name: "m.a"})
+		}
+		file := spec.File{APIVersion: spec.APIVersion, Cluster: "c", Defaults: spec.Defaults{Partitions: 1, ReplicationFactor: 3},
+			Topics: topics, Protected: []string{`^brrrrr\.leases$`}, Prune: spec.PruneRule{Enabled: true, Patterns: pats}}
+		d, err := file.Resolve()
+		if err != nil {
+			t.Fatal(err)
+		}
+		o := Options{Prune: true, PruneMaxDeletes: r.IntN(6), PruneMaxFraction: []float64{0.1, 0.25, 0.5, 1}[r.IntN(4)]}
+		state := observe(t, f)
+		p, err := Compute(d, state, o)
+		var allowed []string
+		for n := range state.Topics {
+			if oracle(pats, listed, n) {
+				allowed = append(allowed, n)
+			}
+		}
+		var pl *PruneLimitError
+		if errors.As(err, &pl) {
+			if pl.Deletes <= o.PruneMaxDeletes && float64(pl.Deletes) <= o.PruneMaxFraction*float64(pl.Matching) {
+				t.Fatalf("iter %d: refused %d deletes within the caps %+v", iter, pl.Deletes, o)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		deletes := 0
+		for _, a := range p.Actions {
+			if a.Kind != Delete {
+				continue
+			}
+			deletes++
+			if !oracle(pats, listed, a.Topic) {
+				t.Fatalf("iter %d: deletes %s, which the oracle does not allow (patterns %v)", iter, a.Topic, pats)
+			}
+		}
+		if deletes != len(allowed) {
+			t.Fatalf("iter %d: %d deletes, the oracle allows %d (%v)", iter, deletes, len(allowed), allowed)
+		}
+		if deletes > o.PruneMaxDeletes {
+			t.Fatalf("iter %d: %d deletes over the cap %d", iter, deletes, o.PruneMaxDeletes)
+		}
 	}
 }

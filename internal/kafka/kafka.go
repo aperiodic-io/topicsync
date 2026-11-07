@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
@@ -145,7 +147,7 @@ func withMessage(err error, msg string) error {
 }
 
 // Observe implements cluster.Cluster.
-func (c *Cluster) Observe(ctx context.Context) (cluster.State, error) {
+func (c *Cluster) Observe(ctx context.Context, configsOf []string) (cluster.State, error) {
 	rctx, cancel := c.ctx(ctx)
 	defer cancel()
 	details, err := c.metadata(rctx, nil)
@@ -175,7 +177,11 @@ func (c *Cluster) Observe(ctx context.Context) (cluster.State, error) {
 		}
 		t.ReplicationFactor = int16(rf)
 		s.Topics[name] = t
-		names = append(names, name)
+	}
+	for _, name := range configsOf {
+		if _, ok := s.Topics[name]; ok {
+			names = append(names, name)
+		}
 	}
 	sort.Strings(names)
 	for start := 0; start < len(names); start += c.cfg.DescribeChunk {
@@ -259,15 +265,22 @@ func (c *Cluster) SetPartitions(ctx context.Context, topic string, n int32) erro
 	rctx, cancel := c.ctx(ctx)
 	defer cancel()
 	resps, err := c.adm.UpdatePartitions(rctx, int(n), topic)
-	if err != nil {
-		return classify(err)
-	}
-	for _, r := range resps {
-		if r.Err != nil {
-			return classify(withMessage(r.Err, r.ErrMessage))
+	if err == nil {
+		for _, r := range resps {
+			if r.Err != nil {
+				err = withMessage(r.Err, r.ErrMessage)
+			}
 		}
 	}
-	return nil
+	if err == nil {
+		return nil
+	}
+	// a retry of an increase that took effect although its answer was lost: brokers refuse an equal count
+	// (INVALID_PARTITIONS); if the topic already has n partitions, the increase is done
+	if md, merr := c.metadata(rctx, []string{topic}); merr == nil && len(md) == 1 && md[0].err == nil && int32(len(md[0].partitions)) >= n { //nolint:gosec // fits
+		return nil
+	}
+	return classify(err)
 }
 
 // DeleteTopic implements cluster.Cluster.
@@ -286,12 +299,17 @@ func (c *Cluster) DeleteTopic(ctx context.Context, topic string) error {
 	return nil
 }
 
-// LeadersReady implements cluster.Cluster. A topic the metadata does not show yet counts as not ready.
-func (c *Cluster) LeadersReady(ctx context.Context, topics []string) (bool, error) {
+// LeadersReady implements cluster.Cluster. A topic the metadata does not show yet, or with fewer partitions than
+// asked, counts as not ready.
+func (c *Cluster) LeadersReady(ctx context.Context, partitions map[string]int32) (bool, error) {
 	rctx, cancel := c.ctx(ctx)
 	defer cancel()
-	if len(topics) == 0 {
+	if len(partitions) == 0 {
 		return true, nil
+	}
+	topics := make([]string, 0, len(partitions))
+	for t := range partitions {
+		topics = append(topics, t)
 	}
 	md, err := c.metadata(rctx, topics)
 	if err != nil {
@@ -301,9 +319,9 @@ func (c *Cluster) LeadersReady(ctx context.Context, topics []string) (bool, erro
 	for _, d := range md {
 		byName[d.topic] = d
 	}
-	for _, name := range topics {
+	for name, want := range partitions {
 		d, ok := byName[name]
-		if !ok || d.err != nil || len(d.partitions) == 0 {
+		if !ok || d.err != nil || len(d.partitions) == 0 || int32(len(d.partitions)) < want { //nolint:gosec // partition counts fit
 			return false, nil
 		}
 		for _, p := range d.partitions {
@@ -363,24 +381,46 @@ func (c *Cluster) GroupUses(ctx context.Context, topic string) ([]cluster.GroupU
 	if err != nil {
 		return nil, fmt.Errorf("describing groups: %w", classify(err))
 	}
-	starts, err := c.adm.ListStartOffsets(rctx, topic)
+	starts, ends, err := c.offsets(rctx, topic)
 	if err != nil {
-		return nil, fmt.Errorf("listing start offsets: %w", classify(err))
-	}
-	ends, err := c.adm.ListEndOffsets(rctx, topic)
-	if err != nil {
-		return nil, fmt.Errorf("listing end offsets: %w", classify(err))
+		return nil, err
 	}
 	var uses []cluster.GroupUse
 	for _, g := range groups {
 		u := cluster.GroupUse{Group: g}
-		if dg, ok := described[g]; ok {
-			if dg.Err != nil {
-				return nil, fmt.Errorf("describing group %s: %w", g, classify(dg.Err))
-			}
+		dg, ok := described[g]
+		switch {
+		case ok && dg.Err == nil && (dg.State != "Dead" || len(dg.Members) > 0):
 			u.State = dg.State
 			for _, m := range dg.Members {
 				if memberUses(m, topic) {
+					u.ActiveMembers++
+				}
+			}
+		case ok && dg.Err != nil && !errors.Is(dg.Err, kerr.GroupIDNotFound):
+			return nil, fmt.Errorf("describing group %s: %w", g, classify(dg.Err))
+		default:
+			// not a classic group: a consumer group of the new protocol (KIP-848, Kafka 4) is "not found" (or, on older
+			// brokers, "Dead" with no members) to DescribeGroups, so ask ConsumerGroupDescribe; an error there is an
+			// error, so an active consumer can never go unseen
+			cg, err := c.adm.DescribeConsumerGroups(rctx, g)
+			if err != nil {
+				if dg.State == "Dead" && dg.Err == nil && errors.Is(err, kerr.UnsupportedVersion) {
+					u.State = "Dead" // a broker without the new protocol: a Dead classic group has no member
+					break
+				}
+				return nil, fmt.Errorf("describing group %s as a consumer group: %w", g, classify(err))
+			}
+			d, ok := cg[g]
+			if !ok {
+				return nil, fmt.Errorf("describing group %s as a consumer group: no answer", g)
+			}
+			if d.Err != nil && !errors.Is(d.Err, kerr.GroupIDNotFound) {
+				return nil, fmt.Errorf("describing group %s as a consumer group: %w", g, classify(d.Err))
+			}
+			u.State = d.State
+			for _, m := range d.Members {
+				if _, assigned := m.Assignment[topic]; assigned || slices.Contains(m.SubscribedTopics, topic) {
 					u.ActiveMembers++
 				}
 			}
@@ -390,17 +430,17 @@ func (c *Cluster) GroupUses(ctx context.Context, topic string) ([]cluster.GroupU
 			return nil, fmt.Errorf("fetching offsets of group %s: %w", g, classify(err))
 		}
 		var lag int64
-		for p, end := range ends[topic] {
-			if end.Err != nil {
-				return nil, fmt.Errorf("end offset of %s/%d: %w", topic, p, classify(end.Err))
-			}
+		for p, end := range ends {
 			committed, ok := offsets.Lookup(topic, p)
-			if ok && committed.Err == nil && committed.At >= 0 {
+			if ok && committed.Err != nil {
+				return nil, fmt.Errorf("committed offset of group %s on %s/%d: %w", g, topic, p, classify(committed.Err))
+			}
+			if ok && committed.At >= 0 {
 				u.Committed = true
-				lag += max(0, end.Offset-committed.At)
+				lag += max(0, end-committed.At)
 				continue
 			}
-			lag += max(0, end.Offset-starts[topic][p].Offset)
+			lag += max(0, end-starts[p])
 		}
 		u.Lag = lag
 		if u.Committed || u.ActiveMembers > 0 {
@@ -428,29 +468,74 @@ func memberUses(m kadm.DescribedGroupMember, topic string) bool {
 	return false
 }
 
-// NewestRecordTime implements cluster.Cluster: it reads the last few records of each non-empty partition and returns
-// the newest timestamp among them.
+// offsets returns each partition's start and end offsets. Any partition's error, or a partition the metadata shows
+// but the answer lacks, is an error: a missing answer must never read as an empty partition.
+func (c *Cluster) offsets(ctx context.Context, topic string) (starts, ends map[int32]int64, err error) {
+	md, err := c.metadata(ctx, []string{topic})
+	if err != nil {
+		return nil, nil, classify(err)
+	}
+	if len(md) != 1 || md[0].err != nil {
+		if len(md) == 1 {
+			return nil, nil, classify(md[0].err)
+		}
+		return nil, nil, fmt.Errorf("%s: %w", topic, cluster.ErrUnknownTopic)
+	}
+	want := len(md[0].partitions)
+	so, err := c.adm.ListStartOffsets(ctx, topic)
+	if err != nil {
+		return nil, nil, classify(err)
+	}
+	eo, err := c.adm.ListEndOffsets(ctx, topic)
+	if err != nil {
+		return nil, nil, classify(err)
+	}
+	starts, ends = map[int32]int64{}, map[int32]int64{}
+	for p, o := range so[topic] {
+		if o.Err != nil {
+			return nil, nil, fmt.Errorf("start offset of %s/%d: %w", topic, p, classify(o.Err))
+		}
+		starts[p] = o.Offset
+	}
+	for p, o := range eo[topic] {
+		if o.Err != nil {
+			return nil, nil, fmt.Errorf("end offset of %s/%d: %w", topic, p, classify(o.Err))
+		}
+		ends[p] = o.Offset
+	}
+	if len(starts) != want || len(ends) != want {
+		return nil, nil, fmt.Errorf("%s has %d partitions, but offsets came back for %d (start) and %d (end)", topic, want, len(starts), len(ends))
+	}
+	return starts, ends, nil
+}
+
+// EndOffsets implements cluster.Cluster.
+func (c *Cluster) EndOffsets(ctx context.Context, topic string) (map[int32]int64, error) {
+	rctx, cancel := c.ctx(ctx)
+	defer cancel()
+	_, ends, err := c.offsets(rctx, topic)
+	return ends, err
+}
+
+// NewestRecordTime implements cluster.Cluster: it reads the last records of each non-empty partition and returns the
+// newest timestamp among them. A partition it cannot read to its end within the request timeout (an unavailable
+// leader; a tail of transaction markers it cannot see past) is an error, never a guess: retire rests on this.
 func (c *Cluster) NewestRecordTime(ctx context.Context, topic string) (time.Time, bool, error) {
 	rctx, cancel := c.ctx(ctx)
 	defer cancel()
-	starts, err := c.adm.ListStartOffsets(rctx, topic)
+	starts, ends, err := c.offsets(rctx, topic)
 	if err != nil {
-		return time.Time{}, false, classify(err)
-	}
-	ends, err := c.adm.ListEndOffsets(rctx, topic)
-	if err != nil {
-		return time.Time{}, false, classify(err)
+		return time.Time{}, false, err
 	}
 	const tail = 5
 	assign := map[int32]kgo.Offset{}
 	want := map[int32]int64{} // partition -> last offset to read
-	for p, end := range ends[topic] {
-		start := starts[topic][p].Offset
-		if end.Err != nil || end.Offset <= start {
+	for p, end := range ends {
+		if end <= starts[p] {
 			continue
 		}
-		assign[p] = kgo.NewOffset().At(max(start, end.Offset-tail))
-		want[p] = end.Offset - 1
+		assign[p] = kgo.NewOffset().At(max(starts[p], end-tail))
+		want[p] = end - 1
 	}
 	if len(assign) == 0 {
 		return time.Time{}, false, nil
@@ -469,9 +554,10 @@ func (c *Cluster) NewestRecordTime(ctx context.Context, topic string) (time.Time
 		if rctx.Err() != nil {
 			break
 		}
-		fetches.EachError(func(_ string, _ int32, e error) { err = e })
-		if err != nil {
-			return time.Time{}, false, classify(err)
+		var ferr error
+		fetches.EachError(func(_ string, _ int32, e error) { ferr = e })
+		if ferr != nil {
+			return time.Time{}, false, classify(ferr)
 		}
 		fetches.EachRecord(func(r *kgo.Record) {
 			if !got || r.Timestamp.After(newest) {
@@ -482,14 +568,16 @@ func (c *Cluster) NewestRecordTime(ctx context.Context, topic string) (time.Time
 			}
 		})
 	}
-	if !got {
-		// non-empty partitions whose tail holds only control records (transaction markers): no timestamp to read
-		if len(want) > 0 && rctx.Err() != nil {
-			return time.Time{}, false, fmt.Errorf("reading the newest records of %s: %w", topic, classify(rctx.Err()))
+	if len(want) > 0 {
+		var parts []string
+		for p := range want {
+			parts = append(parts, fmt.Sprint(p))
 		}
-		return time.Time{}, false, nil
+		sort.Strings(parts)
+		return time.Time{}, false, fmt.Errorf("could not read %s's partitions %s to their end within %s (an unavailable leader, or transaction markers at the tail): its newest record is unknown",
+			topic, strings.Join(parts, ","), c.cfg.RequestTimeout)
 	}
-	return newest, true, nil
+	return newest, got, nil
 }
 
 var _ cluster.Cluster = (*Cluster)(nil)

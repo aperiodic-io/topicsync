@@ -252,7 +252,11 @@ func TestBrokersAndCredentialsFromTheEnvironment(t *testing.T) {
 	if h.got.SASLPassword != "from-file" || !h.got.TLS || h.got.TLSCAFile != "/ca.pem" {
 		t.Errorf("%+v", h.got)
 	}
-	h.expect(h.run("plan", "--spec", h.specPath, "--sasl-mechanism", "PLAIN", "--sasl-password-file", pw+".missing"), ExitUsage)
+	// a Secret that is not mounted is the environment's failure, reported under the config stage, not a usage error
+	h.expect(h.run("plan", "--spec", h.specPath, "--sasl-mechanism", "PLAIN", "--sasl-password-file", pw+".missing"), ExitFailure)
+	// credentials without a mechanism would connect unauthenticated
+	delete(h.env, "TOPICSYNC_SASL_PASSWORD")
+	h.expect(h.run("plan", "--spec", h.specPath, "--sasl-password-file", pw), ExitUsage)
 }
 
 func TestAConnectionFailureExitsOne(t *testing.T) {
@@ -411,5 +415,26 @@ func TestPruneRefusalAndDriftAreReported(t *testing.T) {
 		if !strings.Contains(got[1], want) {
 			t.Errorf("plan push lacks %q", want)
 		}
+	}
+}
+
+func TestConfigFailuresAndDryRunsReportTheirOwnLabels(t *testing.T) {
+	srv, bodies := pushServer(t)
+	h := newHarness(t)
+	h.env["TOPICSYNC_METRICS_PUSH_URL"] = srv.URL
+	h.env["TOPICSYNC_SASL_USER"] = "u"
+	h.expect(h.run("apply", "--spec", h.specPath, "--brokers", "b", "--sasl-mechanism", "SCRAM-SHA-512", "--sasl-password-file", "/nonexistent",
+		"--cluster-label", "metrics-out"), ExitFailure)
+	delete(h.env, "TOPICSYNC_SASL_USER")
+	h.expect(h.run("apply", "--spec", h.specPath, "--brokers", "b", "--dry-run"), ExitOK)
+	got := bodies()
+	if len(got) != 2 {
+		t.Fatalf("%d pushes", len(got))
+	}
+	if !strings.Contains(got[0], `topicsync_last_run_failed_stage{kafka_cluster="metrics-out",mode="apply",stage="config"} 1`) {
+		t.Errorf("config failure:\n%s", got[0])
+	}
+	if !strings.Contains(got[1], `topicsync_last_run_success{kafka_cluster="metrics",mode="dry-run"} 1`) || strings.Contains(got[1], `mode="apply"`) {
+		t.Errorf("a dry run reports as an apply:\n%s", got[1])
 	}
 }

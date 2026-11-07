@@ -63,8 +63,10 @@ type GroupUse struct {
 // Cluster is what topicsync does to a cluster. Every method is safe to retry: creating a topic that exists returns
 // ErrTopicExists, deleting one that does not returns ErrUnknownTopic.
 type Cluster interface {
-	// Observe returns every topic of the cluster, internal ones included, with every config.
-	Observe(ctx context.Context) (State, error)
+	// Observe returns every topic of the cluster, internal ones included, with every config of the topics named in
+	// configsOf (the others with none: the planner reads only the listed topics' configs, and describing every topic
+	// would let one unrelated topic's error fail the run).
+	Observe(ctx context.Context, configsOf []string) (State, error)
 	// CreateTopic creates a topic with its partitions, replication factor and configs.
 	CreateTopic(ctx context.Context, t spec.DesiredTopic) error
 	// AlterConfigs sets the given configs of a topic, incrementally: no other config of the topic changes.
@@ -73,14 +75,17 @@ type Cluster interface {
 	SetPartitions(ctx context.Context, topic string, n int32) error
 	// DeleteTopic deletes a topic and its data.
 	DeleteTopic(ctx context.Context, topic string) error
-	// LeadersReady reports whether every partition of every given topic has a leader: until it does, a broker can
-	// count as unready (a readiness gate on leaderless partitions), so creation is paced on it.
-	LeadersReady(ctx context.Context, topics []string) (bool, error)
+	// LeadersReady reports whether every given topic has at least the given number of partitions in the metadata and
+	// every partition a leader: until then a broker can count as unready (a readiness gate on leaderless partitions),
+	// so creation and partition increases are paced on it.
+	LeadersReady(ctx context.Context, partitions map[string]int32) (bool, error)
 	// GroupUses returns every consumer group that is subscribed to or has committed offsets on a topic.
 	GroupUses(ctx context.Context, topic string) ([]GroupUse, error)
 	// NewestRecordTime returns the timestamp of the newest record of a topic across its partitions, and false if the
-	// topic holds no record.
+	// topic holds no record. Any partition it cannot read to its end is an error, never a guess.
 	NewestRecordTime(ctx context.Context, topic string) (time.Time, bool, error)
+	// EndOffsets returns each partition's end offset; any partition's error is an error.
+	EndOffsets(ctx context.Context, topic string) (map[int32]int64, error)
 	// Close releases the cluster's connections.
 	Close()
 }

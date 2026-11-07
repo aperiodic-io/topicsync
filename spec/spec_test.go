@@ -235,3 +235,70 @@ func TestAnEmptyTopicListIsValidHere(t *testing.T) {
 		t.Fatal(len(d.Topics))
 	}
 }
+
+// A `|` at the top level escapes ^...$: "^tmp\.a|tmp\.b$" would match "tmp.a-PRODUCTION-DATA". Patterns are compiled
+// as a whole-name match, whatever their own anchors.
+func TestPrunePatternsMatchWholeNamesOnly(t *testing.T) {
+	d := mustParse(t, `{"apiVersion": "topicsync.aperiodic.io/v1", "cluster": "c", "defaults": {"partitions": 1, "replicationFactor": 1},
+	  "topics": [{"name": "keep"}], "protected": ["^brrrrr\\.leases|other$"],
+	  "prune": {"enabled": true, "patterns": ["^tmp\\.a|tmp\\.b$"]}}`)
+	for name, want := range map[string]bool{"tmp.a": true, "tmp.b": true, "tmp.a-PRODUCTION-DATA": false, "prod.ohlcv.tmp.b": false} {
+		if got := d.Prunable(name); got != want {
+			t.Errorf("Prunable(%q) = %v, want %v", name, got, want)
+		}
+	}
+	// protected patterns match as written: matching more protects more, the safe direction
+	if !d.IsProtected("brrrrr.leases") || !d.IsProtected("brrrrr.leases-old") || !d.IsProtected("x.other") {
+		t.Error("protected patterns do not match as written")
+	}
+}
+
+// Internal topics (__consumer_offsets, _schemas, _redpanda.*) are the broker's: listing one would put the file's
+// defaults on it (cleanup.policy=delete on a compacted _schemas loses the schemas). They are refused.
+func TestInternalTopicsCannotBeListed(t *testing.T) {
+	ps := problems(t, `{"apiVersion": "topicsync.aperiodic.io/v1", "cluster": "c", "defaults": {"partitions": 1, "replicationFactor": 1},
+	  "topics": [{"name": "_schemas"}, {"name": "__consumer_offsets"}]}`)
+	if !hasProblem(ps, "topics[0] (_schemas): names starting with _ are internal") || !hasProblem(ps, "topics[1] (__consumer_offsets)") {
+		t.Errorf("%v", ps)
+	}
+}
+
+// A reviewer reads the first "prune"; JSON's last-one-wins would apply the second.
+func TestDuplicateKeysAreRefused(t *testing.T) {
+	for _, s := range []string{
+		`{"apiVersion": "topicsync.aperiodic.io/v1", "cluster": "c", "prune": {"enabled": false}, "topics": [{"name": "a", "partitions": 1, "replicationFactor": 1}], "prune": {"enabled": true, "patterns": ["^.*$"]}}`,
+		`{"apiVersion": "topicsync.aperiodic.io/v1", "cluster": "c", "topics": [{"name": "a", "name": "b", "partitions": 1, "replicationFactor": 1}]}`,
+		`{"apiVersion": "topicsync.aperiodic.io/v1", "cluster": "c", "topics": [{"name": "a", "partitions": 1, "replicationFactor": 1, "configs": {"retention.ms": "1", "retention.ms": "2"}}]}`,
+	} {
+		if ps := problems(t, s); !hasProblem(ps, "duplicate key") {
+			t.Errorf("problems %v for %s", ps, s)
+		}
+	}
+}
+
+func TestEmptyOrNullConfigValuesAreRefused(t *testing.T) {
+	for _, v := range []string{`null`, `""`} {
+		ps := problems(t, `{"apiVersion": "topicsync.aperiodic.io/v1", "cluster": "c", "topics": [{"name": "a", "partitions": 1, "replicationFactor": 1, "configs": {"retention.ms": `+v+`}}]}`)
+		if !hasProblem(ps, "retention.ms") {
+			t.Errorf("%s: %v", v, ps)
+		}
+	}
+}
+
+func TestHashIgnoresTheOrderOfPatterns(t *testing.T) {
+	a := mustParse(t, `{"apiVersion": "topicsync.aperiodic.io/v1", "cluster": "c", "topics": [{"name": "a", "partitions": 1, "replicationFactor": 1}],
+	  "protected": ["^x$", "^y$"], "prune": {"enabled": true, "patterns": ["^m\\..*$", "^n\\..*$"]}}`)
+	b := mustParse(t, `{"apiVersion": "topicsync.aperiodic.io/v1", "cluster": "c", "topics": [{"name": "a", "partitions": 1, "replicationFactor": 1}],
+	  "protected": ["^y$", "^x$"], "prune": {"enabled": true, "patterns": ["^n\\..*$", "^m\\..*$"]}}`)
+	if a.Hash != b.Hash {
+		t.Error("reordering patterns changed the hash")
+	}
+}
+
+// Pruning is off unless the file turns it on: a file without a prune section, or with prune disabled, prunes nothing.
+func TestPruningIsOffByDefault(t *testing.T) {
+	d := mustParse(t, `{"apiVersion": "topicsync.aperiodic.io/v1", "cluster": "c", "topics": [{"name": "a", "partitions": 1, "replicationFactor": 1}]}`)
+	if d.Prune.Enabled || d.Prunable("anything.else") {
+		t.Error("a file without a prune section prunes")
+	}
+}

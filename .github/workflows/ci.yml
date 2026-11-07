@@ -10,6 +10,11 @@ concurrency:
   group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 permissions: { contents: read }
+# bash -eo pipefail for every step: a `go test | tee log` step fails when the tests do (GitHub's default shell,
+# bash -e, takes the exit status of tee)
+defaults:
+  run:
+    shell: bash
 env:
   GOFLAGS: -mod=readonly
   # go.mod's toolchain; the go directive stays lower so that importers of spec are not forced up
@@ -21,23 +26,25 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with: { go-version: "${{ env.GO_VERSION }}" }
       - name: go mod tidy leaves nothing to change
         run: go mod tidy && git diff --exit-code go.mod go.sum
-      - uses: golangci/golangci-lint-action@v8
+      - uses: golangci/golangci-lint-action@4afd733a84b1f43292c63897423277bb7f4313a9 # v8
         with: { version: v2.11.4, args: "--build-tags integration,acceptance" }
       - name: shellcheck
         run: shellcheck scripts/*.sh test/e2e/*.sh
+      - name: the migration script's tests (a fake kubectl, every failure path)
+        run: ./scripts/migrate-from-redpanda-operator_test.sh
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
   unit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with: { go-version: "${{ env.GO_VERSION }}" }
       - run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./internal/... ./spec/... ./cmd/...
       # the logic packages are held to 90%: the kafka adapter and the broker helper are covered by the integration
@@ -50,14 +57,14 @@ jobs:
             echo "$pkg: $pct%"
             awk -v p="$pct" -v n="$pkg" 'BEGIN { if (p < 90) { print n " coverage " p "% is under 90%"; exit 1 } }'
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with: { name: coverage, path: "coverage.*" }
 
   fuzz:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with: { go-version: "${{ env.GO_VERSION }}" }
       - run: go test -run '^$' -fuzz FuzzParse -fuzztime 90s ./spec/
 
@@ -73,11 +80,11 @@ jobs:
           - { name: kafka-3.9, flavor: kafka, image: "apache/kafka:3.9.1" }
     name: integration (${{ matrix.name }})
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with: { go-version: "${{ env.GO_VERSION }}" }
       - run: docker pull -q "${{ matrix.image }}"
-      - run: go test -tags integration -count=1 -p 1 -timeout 30m -v ./test/integration/ 2>&1 | tee integration.log
+      - run: go test -tags integration -count=1 -p 1 -timeout 30m -v ./test/integration/ ./internal/kafka/ 2>&1 | tee integration.log
         env:
           TOPICSYNC_IT_FLAVOR: ${{ matrix.flavor }}
           TOPICSYNC_IT_IMAGE: ${{ matrix.image }}
@@ -101,17 +108,21 @@ jobs:
       matrix:
         flavor: [redpanda, kafka]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { fetch-depth: 0 }
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with: { go-version: "${{ env.GO_VERSION }}" }
       # the previous build: the pull request's base, the commit before a push to main, the tag before a release
       - name: build the previous topicsync
         id: prev
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          REF: ${{ github.ref }}
         run: |
-          case "${{ github.event_name }}" in
-            pull_request) ref="origin/${{ github.base_ref }}" ;;
-            push) if [[ "${{ github.ref }}" == refs/tags/* ]]; then ref=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true); else ref=HEAD^; fi ;;
+          case "$EVENT" in
+            pull_request) ref="origin/$BASE_REF" ;;
+            push) if [[ "$REF" == refs/tags/* ]]; then ref=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true); else ref=HEAD^; fi ;;
             *) ref=origin/main ;;
           esac
           if [ -n "$ref" ] && git cat-file -e "$ref:cmd/topicsync/main.go" 2>/dev/null; then
@@ -122,20 +133,33 @@ jobs:
           else
             echo "no previous build with topicsync at '$ref': the upgrade scenario is skipped"
           fi
-      - run: go test -tags acceptance -count=1 -p 1 -timeout 30m -v ./test/acceptance/
+      - run: go test -tags acceptance -count=1 -p 1 -timeout 30m -v ./test/acceptance/ 2>&1 | tee acceptance.log
         env:
           TOPICSYNC_IT_FLAVOR: ${{ matrix.flavor }}
           TOPICSYNC_PREVIOUS_BIN: ${{ steps.prev.outputs.bin }}
+      # without Docker every scenario skips and the job passes: no skip but the image test (the image job runs it)
+      # and the upgrade test when there is no previous build
+      - name: no test may be skipped but the expected ones
+        env:
+          PREV: ${{ steps.prev.outputs.bin }}
+        run: |
+          allowed="TestTheImageRuns"
+          [ -z "$PREV" ] && allowed="$allowed TestUpgradeAndRollbackAgree"
+          bad=0
+          for t in $(grep -oE -- '--- SKIP: [A-Za-z0-9_]+' acceptance.log | awk '{print $3}'); do
+            case " $allowed " in *" $t "*) echo "skipped as expected: $t" ;; *) echo "::error::unexpected skip: $t"; bad=1 ;; esac
+          done
+          exit $bad
 
   image:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with: { go-version: "${{ env.GO_VERSION }}" }
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           load: true
@@ -143,22 +167,22 @@ jobs:
           build-args: VERSION=${{ github.sha }}
       - name: the image runs as a Job runs it, non-root and read-only
         run: |
-          docker run --rm --read-only --user 65532 topicsync:ci version | grep -q "${{ github.sha }}"
+          docker run --rm --read-only --user 65532 topicsync:ci version | grep -q "$GITHUB_SHA"
           go test -tags acceptance -count=1 -run TestTheImageRuns -v ./test/acceptance/
         env: { TOPICSYNC_IMAGE: "topicsync:ci" }
       - run: docker save topicsync:ci -o /tmp/topicsync-image.tar
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with: { name: image, path: /tmp/topicsync-image.tar, retention-days: 3 }
 
   e2e-kind:
     needs: image
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with: { name: image, path: /tmp }
       - run: docker load -i /tmp/topicsync-image.tar
-      - uses: helm/kind-action@v1
+      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1
         with: { install_only: true }
       - run: ./test/e2e/kind.sh
         env: { TOPICSYNC_IMAGE: "topicsync:ci", REDPANDA_IMAGE: "${{ env.REDPANDA_CURRENT }}" }
@@ -171,22 +195,30 @@ jobs:
     runs-on: ubuntu-latest
     permissions: { contents: write, packages: write }
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with: { go-version: "${{ env.GO_VERSION }}" }
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      # every image is tagged with its commit; only a pushed tag moves :<tag> and :latest, and only a push to main moves
+      # :main (a dispatch, of any branch or tag, publishes its commit's tag alone, for a staging test)
       - id: tags
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
         run: |
-          img=ghcr.io/${{ github.repository }}
-          tags="$img:${{ github.sha }}"
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then tags="$tags,$img:${GITHUB_REF_NAME},$img:latest"
-          elif [[ "${{ github.ref }}" == refs/heads/main ]]; then tags="$tags,$img:main"; fi
+          img="ghcr.io/$REPO"
+          tags="$img:$SHA"
+          version="$SHA"
+          if [[ "$EVENT" == push && "$REF" == refs/tags/* ]]; then tags="$tags,$img:$GITHUB_REF_NAME,$img:latest"; version="$GITHUB_REF_NAME"
+          elif [[ "$EVENT" == push && "$REF" == refs/heads/main ]]; then tags="$tags,$img:main"; fi
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
-          echo "version=$([[ "${{ github.ref }}" == refs/tags/* ]] && echo "$GITHUB_REF_NAME" || echo "${{ github.sha }}")" >> "$GITHUB_OUTPUT"
-      - uses: docker/build-push-action@v6
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           push: true
@@ -196,7 +228,7 @@ jobs:
           provenance: true
           sbom: true
       - name: release binaries
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         run: |
           mkdir dist
           for os_arch in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do

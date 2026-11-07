@@ -5,7 +5,8 @@
 //   - the topic is not protected (internal topics, the file's protected patterns);
 //   - no consumer group has a member assigned to it now;
 //   - every consumer group that committed on it has read it to the end (lag 0), so nothing unread is lost;
-//   - its newest record is older than the idle threshold, so nothing still writes it;
+//   - its newest record is older than the idle threshold, and its end offsets do not move over a wait: record
+//     timestamps are the producer's to set (event time, a backfill), so they alone cannot prove nothing writes it;
 //   - the caller confirmed with the topic's exact name.
 package retire
 
@@ -26,6 +27,10 @@ type Options struct {
 	Confirm string
 	// MinIdle is how old the newest record must be.
 	MinIdle time.Duration
+	// WriteCheck is how long the end offsets are watched for a write; 0 skips the check.
+	WriteCheck time.Duration
+	// Sleep waits; tests replace it.
+	Sleep func(ctx context.Context, d time.Duration) error
 	// Now is the current time; tests replace it.
 	Now func() time.Time
 }
@@ -59,7 +64,19 @@ func Retire(ctx context.Context, c cluster.Cluster, d *spec.Desired, topic strin
 		o.Now = time.Now
 	}
 	rep := Report{Topic: topic}
-	state, err := c.Observe(ctx)
+	if o.Sleep == nil {
+		o.Sleep = func(ctx context.Context, d time.Duration) error {
+			t := time.NewTimer(d)
+			defer t.Stop()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-t.C:
+				return nil
+			}
+		}
+	}
+	state, err := c.Observe(ctx, nil)
 	if err != nil {
 		return rep, fmt.Errorf("observing the cluster: %w", err)
 	}
@@ -96,6 +113,27 @@ func Retire(ctx context.Context, c cluster.Cluster, d *spec.Desired, topic strin
 	if has {
 		if age := o.Now().Sub(newest); age < o.MinIdle {
 			reasons = append(reasons, fmt.Sprintf("its newest record is %s old, less than --min-idle %s: something may still write it", age.Round(time.Second), o.MinIdle))
+		}
+	}
+	if o.WriteCheck > 0 && len(reasons) == 0 {
+		before, err := c.EndOffsets(ctx, topic)
+		if err != nil {
+			return rep, fmt.Errorf("reading its end offsets: %w", err)
+		}
+		if err := o.Sleep(ctx, o.WriteCheck); err != nil {
+			return rep, err
+		}
+		after, err := c.EndOffsets(ctx, topic)
+		if err != nil {
+			return rep, fmt.Errorf("reading its end offsets: %w", err)
+		}
+		for p, end := range after {
+			if end != before[p] {
+				reasons = append(reasons, fmt.Sprintf("partition %d grew from offset %d to %d within %s: something writes it", p, before[p], end, o.WriteCheck))
+			}
+		}
+		if len(after) != len(before) {
+			reasons = append(reasons, fmt.Sprintf("its partition count changed from %d to %d during the write check", len(before), len(after)))
 		}
 	}
 	if len(reasons) > 0 {

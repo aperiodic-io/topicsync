@@ -154,7 +154,7 @@ func TestAPermanentFailureIsNotRetriedAndDoesNotStopTheRest(t *testing.T) {
 func TestATopicCreatedMeanwhileIsAlreadyDoneAndVerified(t *testing.T) {
 	f := cluster.NewFake(map[string]string{"cleanup.policy": "delete"})
 	d := desiredN(t, 1, false)
-	state, _ := f.Observe(context.Background())
+	state, _ := f.Observe(context.Background(), f.Names())
 	p, err := plan.Compute(d, state, plan.DefaultOptions())
 	if err != nil {
 		t.Fatal(err)
@@ -170,7 +170,7 @@ func TestATopicCreatedMeanwhileIsAlreadyDoneAndVerified(t *testing.T) {
 	f2 := cluster.NewFake(map[string]string{"cleanup.policy": "delete"})
 	f2.Put("m.00", 2, 1, map[string]string{"cleanup.policy": "compact"})
 	r = Execute(context.Background(), f2, p, opts(&s))
-	state, _ = f2.Observe(context.Background())
+	state, _ = f2.Observe(context.Background(), f2.Names())
 	again, _ := plan.Compute(d, state, plan.DefaultOptions())
 	if r.AlreadyDone != 1 || again.Count(plan.AlterConfigs) != 1 {
 		t.Fatalf("another creator's config is not left for the verification to find: %+v %s", r, again.Text())
@@ -251,7 +251,7 @@ func TestACancelledRunFailsTheRemainingActions(t *testing.T) {
 	f := cluster.NewFake(map[string]string{"cleanup.policy": "delete"})
 	ctx, cancel := context.WithCancel(context.Background())
 	d := desiredN(t, 6, false)
-	state, _ := f.Observe(ctx)
+	state, _ := f.Observe(ctx, f.Names())
 	p, _ := plan.Compute(d, state, plan.DefaultOptions())
 	o := opts(&sleeps{})
 	o.Sleep = func(context.Context, time.Duration) error { cancel(); return context.Canceled }
@@ -357,5 +357,56 @@ func TestOutcomeNamesTheFailedStageAndCountsRetries(t *testing.T) {
 	out, err := Run(context.Background(), g, desiredN(t, 1, false), plan.DefaultOptions(), opts(&sleeps{}), false)
 	if err != nil || out.Stage != "" || out.Stats.Retries != 1 || out.Stats.LeaderWait <= 0 {
 		t.Errorf("%v stage %q stats %+v", err, out.Stage, out.Stats)
+	}
+}
+
+// A broker that has not caught up with an alter reports the old value for a moment: the verification tries again
+// before calling the run not converged.
+func TestVerificationRetriesBeforeNotConverged(t *testing.T) {
+	f := &lagging{Fake: cluster.NewFake(map[string]string{"cleanup.policy": "delete"}), stale: 2}
+	f.Put("m.00", 2, 1, map[string]string{"cleanup.policy": "compact"})
+	o := opts(&sleeps{})
+	o.VerifyAttempts, o.VerifyPause = 4, time.Second
+	if _, err := Run(context.Background(), f, desiredN(t, 1, false), plan.DefaultOptions(), o, false); err != nil {
+		t.Fatalf("a broker two observations behind failed the run: %v", err)
+	}
+	g := &lagging{Fake: cluster.NewFake(map[string]string{"cleanup.policy": "delete"}), stale: 10}
+	g.Put("m.00", 2, 1, map[string]string{"cleanup.policy": "compact"})
+	if _, err := Run(context.Background(), g, desiredN(t, 1, false), plan.DefaultOptions(), o, false); !errors.Is(err, ErrNotConverged) {
+		t.Fatalf("a broker that never catches up: %v", err)
+	}
+}
+
+// lagging reports the pre-alter state for its first `stale` observations after an alter.
+type lagging struct {
+	*cluster.Fake
+	stale   int
+	altered bool
+	before  cluster.State
+}
+
+func (l *lagging) AlterConfigs(ctx context.Context, topic string, set map[string]string) error {
+	l.before, _ = l.Observe(ctx, l.Names())
+	l.altered = true
+	return l.Fake.AlterConfigs(ctx, topic, set)
+}
+
+func (l *lagging) Observe(ctx context.Context, configsOf []string) (cluster.State, error) {
+	if l.altered && l.stale > 0 {
+		l.stale--
+		return l.before, nil
+	}
+	return l.Fake.Observe(ctx, configsOf)
+}
+
+// A partition increase is paced on the new partitions' leaders, not only on the partitions there before.
+func TestPartitionIncreasesWaitForTheNewPartitions(t *testing.T) {
+	f := cluster.NewFake(map[string]string{"cleanup.policy": "delete"})
+	f.Put("m.00", 1, 1, map[string]string{"cleanup.policy": "delete"})
+	f.LeaderDelay = 2
+	var s sleeps
+	out, err := Run(context.Background(), f, desiredN(t, 1, false), plan.DefaultOptions(), opts(&s), false)
+	if err != nil || out.Result.Executed[plan.AddPartitions] != 1 || s.count(time.Millisecond) < 2 {
+		t.Fatalf("%v %+v polls %d", err, out.Result, s.count(time.Millisecond))
 	}
 }

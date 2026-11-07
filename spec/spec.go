@@ -76,10 +76,13 @@ type PruneRule struct {
 
 // Desired is the validated file: every topic resolved against the defaults.
 type Desired struct {
-	Cluster   string
-	Topics    map[string]DesiredTopic
-	Protected []*regexp.Regexp
-	Prune     Prune
+	Cluster string
+	Topics  map[string]DesiredTopic
+	// Protected are the protected patterns compiled as whole-name matches (the built-in one first); ProtectedSource
+	// and Prune.Source are the patterns as written, which the hash and re-encoding use.
+	Protected       []*regexp.Regexp
+	ProtectedSource []string
+	Prune           Prune
 	// Hash is the SHA-256 of the canonical form of the resolved state: two files that mean the same topics have the
 	// same hash, whatever their key order or whitespace. A Kubernetes Job named after it runs once per change.
 	Hash string
@@ -97,11 +100,14 @@ type DesiredTopic struct {
 type Prune struct {
 	Enabled  bool
 	Patterns []*regexp.Regexp
+	Source   []string
 }
 
 // BuiltinProtected are never deleted, whatever the file says: Kafka's and Redpanda's own topics (`__consumer_offsets`,
 // `_schemas`, `_redpanda.*`), all of which start with an underscore.
 var BuiltinProtected = []*regexp.Regexp{regexp.MustCompile(`^_`)}
+
+const builtinProtectedSource = `^_`
 
 // ValidationError lists every problem found in a file, so that one run reports them all.
 type ValidationError struct {
@@ -179,6 +185,11 @@ func (f File) Resolve() (*Desired, error) {
 			add("%s: %s", where, msg)
 			continue
 		}
+		if strings.HasPrefix(t.Name, "_") {
+			// listing one would put the file's defaults on it: cleanup.policy=delete on a compacted _schemas
+			add("%s: names starting with _ are internal topics (the broker's own), which topicsync does not manage", where)
+			continue
+		}
 		if _, dup := d.Topics[t.Name]; dup {
 			add("%s: listed more than once", where)
 			continue
@@ -211,18 +222,21 @@ func (f File) Resolve() (*Desired, error) {
 	}
 
 	d.Protected = append(d.Protected, BuiltinProtected...)
+	d.ProtectedSource = append(d.ProtectedSource, builtinProtectedSource)
 	for i, p := range f.Protected {
+		// as written: a protected pattern that matches more protects more (the safe direction), unlike a prune pattern
 		re, err := regexp.Compile(p)
 		if err != nil {
 			add("protected[%d] %q: %v", i, p, err)
 			continue
 		}
 		d.Protected = append(d.Protected, re)
+		d.ProtectedSource = append(d.ProtectedSource, p)
 	}
 
 	d.Prune.Enabled = f.Prune.Enabled
 	for i, p := range f.Prune.Patterns {
-		re, err := regexp.Compile(p)
+		re, err := wholeName(p)
 		if err != nil {
 			add("prune.patterns[%d] %q: %v", i, p, err)
 			continue
@@ -232,6 +246,7 @@ func (f File) Resolve() (*Desired, error) {
 			continue
 		}
 		d.Prune.Patterns = append(d.Prune.Patterns, re)
+		d.Prune.Source = append(d.Prune.Source, p)
 	}
 	if f.Prune.Enabled && len(f.Prune.Patterns) == 0 {
 		add("prune.enabled without prune.patterns: name the topics that may be pruned")
@@ -242,6 +257,15 @@ func (f File) Resolve() (*Desired, error) {
 	}
 	d.Hash = d.canonicalHash()
 	return d, nil
+}
+
+// wholeName compiles a pattern to match whole names only: "^a|b$" written by hand matches "a..." or "...b", so the
+// pattern is wrapped in ^(?:...)$ whatever its own anchors.
+func wholeName(p string) (*regexp.Regexp, error) {
+	if _, err := regexp.Compile(p); err != nil {
+		return nil, err
+	}
+	return regexp.Compile("^(?:" + p + ")$")
 }
 
 func checkName(name string) string {
@@ -262,6 +286,8 @@ func checkConfig(key, value string) string {
 	switch {
 	case strings.TrimSpace(key) == "" || key != strings.TrimSpace(key):
 		return fmt.Sprintf("config key %q is empty or has surrounding whitespace", key)
+	case value == "":
+		return fmt.Sprintf("config %s has an empty (or null) value: leave the key out to keep the broker's", key)
 	case value != strings.TrimSpace(value):
 		return fmt.Sprintf("config %s value %q has surrounding whitespace", key, value)
 	}
@@ -343,12 +369,11 @@ func (d *Desired) canonicalHash() string {
 		}
 		c.Topics = append(c.Topics, entry)
 	}
-	for _, re := range d.Protected {
-		c.Protected = append(c.Protected, re.String())
-	}
-	for _, re := range d.Prune.Patterns {
-		c.Patterns = append(c.Patterns, re.String())
-	}
+	c.Protected = append(c.Protected, d.ProtectedSource...)
+	c.Patterns = append(c.Patterns, d.Prune.Source...)
+	// a set of patterns, whatever order the file lists them in
+	sort.Strings(c.Protected)
+	sort.Strings(c.Patterns)
 	b, err := json.Marshal(c)
 	if err != nil {
 		panic(err) // plain values only
@@ -384,7 +409,7 @@ func checkKeys(data []byte) []string {
 	if err := json.Unmarshal(data, &v); err != nil {
 		return nil
 	}
-	var problems []string
+	problems := duplicateKeys(data)
 	var walk func(v any, s schema, path string)
 	walk = func(v any, s schema, path string) {
 		switch x := v.(type) {
@@ -414,3 +439,50 @@ func checkKeys(data []byte) []string {
 // ShortHash is the first 10 hex digits of Hash: enough to tell versions of one file apart, short enough for a
 // Kubernetes object name (topicsync-<cluster>-<short hash>).
 func (d *Desired) ShortHash() string { return d.Hash[:10] }
+
+// duplicateKeys reports every object key given twice in one object: JSON decoders keep the last, while a reviewer
+// reads the first.
+func duplicateKeys(data []byte) []string {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	var problems []string
+	var walk func(path string) error
+	walk = func(path string) error {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		switch tok {
+		case json.Delim('{'):
+			seen := map[string]bool{}
+			for dec.More() {
+				kt, err := dec.Token()
+				if err != nil {
+					return err
+				}
+				k, _ := kt.(string)
+				if seen[k] {
+					problems = append(problems, fmt.Sprintf("%sduplicate key %q", path, k))
+				}
+				seen[k] = true
+				if err := walk(path + k + "."); err != nil {
+					return err
+				}
+			}
+			_, err = dec.Token()
+			return err
+		case json.Delim('['):
+			for i := 0; dec.More(); i++ {
+				if err := walk(fmt.Sprintf("%s[%d].", strings.TrimSuffix(path, "."), i)); err != nil {
+					return err
+				}
+			}
+			_, err = dec.Token()
+			return err
+		}
+		return nil
+	}
+	if err := walk(""); err != nil {
+		return nil // malformed: the decoder reports it
+	}
+	return problems
+}

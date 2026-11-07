@@ -163,3 +163,34 @@ func TestNowDefaultsToTheClock(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Record timestamps are the producer's: a topic stamped with event time looks idle while it is written. End offsets
+// that move during the write check refuse the retirement.
+func TestATopicStillWrittenIsRefusedWhateverItsTimestamps(t *testing.T) {
+	f, d := setup(t)
+	f.Ends["old.topic"] = []map[int32]int64{{0: 100}, {0: 103}}
+	opts := o("old.topic")
+	opts.WriteCheck = time.Minute
+	var waited time.Duration
+	opts.Sleep = func(_ context.Context, d time.Duration) error { waited = d; return nil }
+	_, err := Retire(context.Background(), f, d, "old.topic", opts)
+	refusal(t, err, "partition 0 grew from offset 100 to 103")
+	if waited != time.Minute || !f.Has("old.topic") {
+		t.Fatalf("waited %s, exists %v", waited, f.Has("old.topic"))
+	}
+	f.Ends["old.topic"] = []map[int32]int64{{0: 103}, {0: 103}}
+	if rep, err := Retire(context.Background(), f, d, "old.topic", opts); err != nil || !rep.Deleted {
+		t.Fatalf("still end offsets: %+v %v", rep, err)
+	}
+}
+
+func TestEndOffsetErrorsDuringTheWriteCheckAreErrors(t *testing.T) {
+	f, d := setup(t)
+	f.FailOn["ends:old.topic"] = errors.New("KAFKA_STORAGE_ERROR")
+	opts := o("old.topic")
+	opts.WriteCheck = time.Second
+	opts.Sleep = func(context.Context, time.Duration) error { return nil }
+	if _, err := Retire(context.Background(), f, d, "old.topic", opts); err == nil || !f.Has("old.topic") {
+		t.Fatalf("an end-offset error let it through: %v", err)
+	}
+}

@@ -27,13 +27,18 @@ dump() {
   k -n redpanda get pods,jobs,topics.cluster.redpanda.com 2>/dev/null || true
   for j in $(k -n redpanda get jobs -o name 2>/dev/null); do echo "--- $j"; k -n redpanda logs "$j" --tail 40 2>/dev/null || true; done
 }
-cleanup() { [[ "${KEEP_CLUSTER:-0}" == 1 ]] || kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true; }
+created=0
+cleanup() { [[ "${KEEP_CLUSTER:-0}" == 1 || $created == 0 ]] || kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 hw() { # topic -> sum of its partitions' high watermarks (the last column of rpk's table)
   rpk topic describe "$1" -p | awk 'NR>1 {s+=$NF} END {print s+0}'
 }
-has_topic() { rpk topic list | awk 'NR>1 {print $1}' | grep -qx "$1"; }
+has_topic() { # an rpk error fails the test: it must never read as "the topic is gone"
+  local list
+  list=$(rpk topic list) || fail "rpk topic list failed"
+  awk 'NR>1 {print $1}' <<<"$list" | grep -qx "$1"
+}
 config() { rpk topic describe "$1" -c | awk -v k="$2" '$1==k {print $2}'; }
 
 job() { # name configmap args... -> applies the Job
@@ -44,7 +49,10 @@ job() { # name configmap args... -> applies the Job
 spec_cm() { k -n redpanda create configmap "$1" --from-file=topics.json="$2" --dry-run=client -o yaml | k apply -f - >/dev/null; }
 
 log "kind cluster $CLUSTER"
-kind get clusters 2>/dev/null | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER" --wait 120s
+if ! kind get clusters 2>/dev/null | grep -qx "$CLUSTER"; then
+  kind create cluster --name "$CLUSTER" --wait 120s
+  created=1 # only a cluster this run made is deleted at the end
+fi
 if [[ "$IMAGE" == "topicsync:e2e" ]]; then
   log "building $IMAGE"
   docker build -q -t "$IMAGE" ../.. >/dev/null
@@ -83,7 +91,7 @@ log "  the operator deleted the Kafka topic e2e.deleteme (as expected)"
 
 log "migration"
 ../../scripts/migrate-from-redpanda-operator.sh --namespace redpanda --operator-deployment redpanda-operator \
-  --snapshot-dir "$(mktemp -d)" --timeout 180
+  --spec spec-adopt.json --snapshot-dir "$(mktemp -d)/snapshot" --timeout 180
 [[ "$(k -n redpanda get topics.cluster.redpanda.com -o name | wc -l)" == 0 ]] || fail "Topic resources left"
 k -n redpanda rollout status deployment/redpanda-operator --timeout=180s >/dev/null
 log "  operator back; waiting a minute for it to act on anything it still knew about"

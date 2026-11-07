@@ -54,19 +54,41 @@ func TestTextIsPrometheusExposition(t *testing.T) {
 	}
 }
 
-func TestAFailedRunWithoutAPlanStillReports(t *testing.T) {
-	r := Run{Cluster: "c", Mode: "plan", Start: time.Unix(1, 0)}
+// A run that failed before planning measured no drift: it reports its failure, and none of the plan's families, so
+// that a drift alert does not resolve on a run that saw nothing.
+func TestAFailedRunWithoutAPlanReportsNoPlanFamilies(t *testing.T) {
+	r := Run{Cluster: "c", Mode: "plan", Start: time.Unix(1, 0), FailedStage: "observe"}
 	text := r.Text()
 	if !strings.Contains(text, `topicsync_last_run_success{kafka_cluster="c",mode="plan"} 0`) ||
-		!strings.Contains(text, `topicsync_planned_actions{kafka_cluster="c",mode="plan",kind="create"} 0`) {
+		!strings.Contains(text, `topicsync_last_run_failed_stage{kafka_cluster="c",mode="plan",stage="observe"} 1`) {
 		t.Errorf("%s", text)
+	}
+	for _, absent := range []string{"topicsync_planned_actions{", "topicsync_pending_actions{", "topicsync_unmanaged_topics{", "topicsync_observed_topics{", "topicsync_warnings{", "topicsync_topic_drift{"} {
+		if strings.Contains(text, absent) {
+			t.Errorf("an unmeasured family %s is reported", absent)
+		}
+	}
+	// an apply whose verification failed: the plan before, but no pending counts
+	r = Run{Cluster: "c", Mode: "apply", Planned: &plan.Plan{}, FailedStage: "verify"}
+	if text := r.Text(); strings.Contains(text, "topicsync_pending_actions{") || !strings.Contains(text, "topicsync_planned_actions{") {
+		t.Errorf("verify failure:\n%s", text)
 	}
 }
 
-func TestLabelValuesAreEscaped(t *testing.T) {
-	r := Run{Cluster: "a\"b\\c\nd", Mode: "plan"}
-	if !strings.Contains(r.Text(), `kafka_cluster="a\"b\\c d"`) {
+// Prometheus' text format escapes only backslash, double quote and newline; a tab stays a tab.
+func TestLabelValuesAreEscapedAsPrometheusExpects(t *testing.T) {
+	r := Run{Cluster: "a\"b\\c\nd\te", Mode: "plan"}
+	if !strings.Contains(r.Text(), `kafka_cluster="a\"b\\c\nd`+"\t"+`e"`) {
 		t.Errorf("%s", r.Text())
+	}
+}
+
+// One series per topic and kind, even with two sensitive keys on a topic: a Pushgateway refuses duplicates.
+func TestPerTopicSeriesAreUnique(t *testing.T) {
+	r := Run{Cluster: "c", Mode: "plan", Planned: &plan.Plan{Warnings: []plan.Warning{
+		{Kind: plan.SensitiveConfig, Topic: "t"}, {Kind: plan.SensitiveConfig, Topic: "t"}}}}
+	if n := strings.Count(r.Text(), "topicsync_topic_warning{"); n != 1 {
+		t.Errorf("%d series for one topic and kind", n)
 	}
 }
 
@@ -86,6 +108,32 @@ func TestPushPostsTheText(t *testing.T) {
 	}
 	if got != "x 1\n" || !strings.HasPrefix(ctype, "text/plain") {
 		t.Errorf("body %q type %q", got, ctype)
+	}
+}
+
+// A Pushgateway group is replaced whole (PUT), so a topic that stopped drifting loses its series; other endpoints
+// (VictoriaMetrics' import) get a POST.
+func TestPushUsesPUTForAPushgatewayGroup(t *testing.T) {
+	var method string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { method = r.Method }))
+	defer srv.Close()
+	if err := Push(context.Background(), nil, srv.URL+"/metrics/job/topicsync/kafka_cluster/x", "x 1\n"); err != nil || method != http.MethodPut {
+		t.Errorf("pushgateway: %s %v", method, err)
+	}
+	if err := Push(context.Background(), nil, srv.URL+"/api/v1/import/prometheus", "x 1\n"); err != nil || method != http.MethodPost {
+		t.Errorf("import: %s %v", method, err)
+	}
+}
+
+func TestPushErrorsHideThePassword(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "no", http.StatusUnauthorized) }))
+	defer srv.Close()
+	u := strings.Replace(srv.URL, "http://", "http://user:s3cret@", 1)
+	for _, target := range []string{u, "http://user:s3cret@127.0.0.1:1/x"} {
+		err := Push(context.Background(), nil, target, "x 1\n")
+		if err == nil || strings.Contains(err.Error(), "s3cret") {
+			t.Errorf("error %v shows the password", err)
+		}
 	}
 }
 
@@ -118,6 +166,9 @@ func TestWriteFileReplacesAtomically(t *testing.T) {
 	b, _ := os.ReadFile(p)
 	if string(b) != "a 2\n" {
 		t.Errorf("%q", b)
+	}
+	if st, _ := os.Stat(p); st.Mode().Perm() != 0o644 {
+		t.Errorf("mode %v: a textfile collector running as another user cannot read it", st.Mode().Perm())
 	}
 	entries, _ := os.ReadDir(dir)
 	if len(entries) != 1 {

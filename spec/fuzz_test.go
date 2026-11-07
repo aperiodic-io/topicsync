@@ -22,12 +22,8 @@ func FuzzParse(f *testing.F) {
 			return
 		}
 		file := File{APIVersion: APIVersion, Cluster: d.Cluster, Prune: PruneRule{Enabled: d.Prune.Enabled}}
-		for _, re := range d.Protected[len(BuiltinProtected):] {
-			file.Protected = append(file.Protected, re.String())
-		}
-		for _, re := range d.Prune.Patterns {
-			file.Prune.Patterns = append(file.Prune.Patterns, re.String())
-		}
+		file.Protected = append(file.Protected, d.ProtectedSource[1:]...)
+		file.Prune.Patterns = append(file.Prune.Patterns, d.Prune.Source...)
 		for _, n := range d.Names() {
 			t := d.Topics[n]
 			file.Topics = append(file.Topics, Topic{Name: n, Partitions: t.Partitions, ReplicationFactor: t.ReplicationFactor, Configs: t.Configs})

@@ -38,7 +38,7 @@ func TestThreeBrokersReplicationThreeAndAStalledBroker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, _ := c.Observe(ctx(t))
+	s, _ := c.Observe(ctx(t), nil)
 	if s.Topics["rf3.00"].ReplicationFactor != 3 || out.Result.Executed[plan.Create] != 30 {
 		t.Fatalf("rf %d created %d", s.Topics["rf3.00"].ReplicationFactor, out.Result.Executed[plan.Create])
 	}

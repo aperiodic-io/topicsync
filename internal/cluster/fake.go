@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,6 +34,10 @@ type Fake struct {
 	Groups map[string][]GroupUse
 	// Newest is each topic's newest record time; absent: empty.
 	Newest map[string]time.Time
+	// Ends is each topic's end offsets, a sequence: each EndOffsets call takes the next (the last one repeats).
+	Ends map[string][]map[int32]int64
+	// Unreported are config keys the broker accepts but never reports (Redpanda: unclean.leader.election.enable).
+	Unreported map[string]bool
 	// Calls records every mutating call in order ("create:t", "alter:t:k=v,...", "partitions:t:3", "delete:t").
 	Calls []string
 }
@@ -57,6 +62,8 @@ func NewFake(defaults map[string]string) *Fake {
 		FailAlways: map[string]error{},
 		Groups:     map[string][]GroupUse{},
 		Newest:     map[string]time.Time{},
+		Ends:       map[string][]map[int32]int64{},
+		Unreported: map[string]bool{},
 	}
 }
 
@@ -137,7 +144,7 @@ func (f *Fake) fail(op, topic string) error {
 }
 
 // Observe implements Cluster.
-func (f *Fake) Observe(ctx context.Context) (State, error) {
+func (f *Fake) Observe(ctx context.Context, configsOf []string) (State, error) {
 	if err := ctx.Err(); err != nil {
 		return State{}, err
 	}
@@ -151,14 +158,22 @@ func (f *Fake) Observe(ctx context.Context) (State, error) {
 	if f.ObserveErr != nil {
 		return State{}, f.ObserveErr
 	}
+	describe := map[string]bool{}
+	for _, n := range configsOf {
+		describe[n] = true
+	}
 	s := State{Topics: make(map[string]TopicState, len(f.topics))}
 	for name, t := range f.topics {
-		configs := make(map[string]ConfigValue, len(f.Defaults)+len(t.configs))
-		for k, v := range f.Defaults {
-			configs[k] = ConfigValue{Value: v, Source: SourceDefault}
-		}
-		for k, v := range t.configs {
-			configs[k] = ConfigValue{Value: v, Source: SourceDynamicTopic}
+		configs := map[string]ConfigValue{}
+		if describe[name] {
+			for k, v := range f.Defaults {
+				configs[k] = ConfigValue{Value: v, Source: SourceDefault}
+			}
+			for k, v := range t.configs {
+				if !f.Unreported[k] {
+					configs[k] = ConfigValue{Value: normalize(k, v), Source: SourceDynamicTopic}
+				}
+			}
 		}
 		s.Topics[name] = TopicState{Name: name, Partitions: t.partitions, ReplicationFactor: t.rf, Configs: configs, Internal: t.internal}
 	}
@@ -238,8 +253,9 @@ func (f *Fake) SetPartitions(ctx context.Context, topic string, n int32) error {
 	if !ok {
 		return fmt.Errorf("%s: %w", topic, ErrUnknownTopic)
 	}
-	if n < t.partitions {
-		return fmt.Errorf("%s: cannot lower partitions from %d to %d", topic, t.partitions, n)
+	if n <= t.partitions {
+		// as brokers do: INVALID_PARTITIONS for a count that is not an increase, also an equal one
+		return fmt.Errorf("%s: INVALID_PARTITIONS: %d is not more than the current %d", topic, n, t.partitions)
 	}
 	t.partitions = n
 	t.leaderlessN = f.LeaderDelay
@@ -265,17 +281,18 @@ func (f *Fake) DeleteTopic(ctx context.Context, topic string) error {
 }
 
 // LeadersReady implements Cluster.
-func (f *Fake) LeadersReady(ctx context.Context, topics []string) (bool, error) {
+func (f *Fake) LeadersReady(ctx context.Context, partitions map[string]int32) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	ready := true
-	for _, name := range topics {
+	for name, want := range partitions {
 		t, ok := f.topics[name]
-		if !ok {
-			return false, fmt.Errorf("%s: %w", name, ErrUnknownTopic)
+		if !ok || t.partitions < want {
+			ready = false
+			continue
 		}
 		if t.leaderlessN > 0 {
 			t.leaderlessN--
@@ -312,7 +329,55 @@ func (f *Fake) NewestRecordTime(ctx context.Context, topic string) (time.Time, b
 	return t, ok, nil
 }
 
+// EndOffsets implements Cluster.
+func (f *Fake) EndOffsets(ctx context.Context, topic string) (map[int32]int64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail("ends", topic); err != nil {
+		return nil, err
+	}
+	seq := f.Ends[topic]
+	if len(seq) == 0 {
+		return map[int32]int64{0: 0}, nil
+	}
+	e := seq[0]
+	if len(seq) > 1 {
+		f.Ends[topic] = seq[1:]
+	}
+	return e, nil
+}
+
+// normalize reports a value as brokers do: list values sorted (Redpanda reports "delete,compact" as
+// "compact,delete"), booleans lower case (Kafka reports "False" as "false").
+func normalize(key, v string) string {
+	switch strings.ToLower(v) {
+	case "true", "false":
+		return strings.ToLower(v)
+	}
+	if key == "cleanup.policy" && strings.Contains(v, ",") {
+		parts := strings.Split(v, ",")
+		sort.Strings(parts)
+		return strings.Join(parts, ",")
+	}
+	return v
+}
+
 // Close implements Cluster.
 func (f *Fake) Close() {}
 
 var _ Cluster = (*Fake)(nil)
+
+// Names returns every topic's name, for an Observe that describes them all.
+func (f *Fake) Names() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.topics))
+	for n := range f.topics {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}

@@ -72,6 +72,9 @@ const (
 	SensitiveConfig WarningKind = "sensitive_config"
 	// PruneNotRequested: a topic would be pruned, but pruning was not requested on this run.
 	PruneNotRequested WarningKind = "prune_not_requested"
+	// UnreportedConfig: the broker does not report a desired config of an existing topic (it ignores the key, or does
+	// not know it): setting it would be planned again on every run, so it is reported instead.
+	UnreportedConfig WarningKind = "unreported_config"
 )
 
 // Warning is something topicsync will not change but reports.
@@ -164,16 +167,15 @@ func Compute(d *spec.Desired, s cluster.State, o Options) (*Plan, error) {
 			wantV := want.Configs[key]
 			haveC, known := have.Configs[key]
 			switch {
-			case known && haveC.Sensitive:
+			case !known:
+				p.Warnings = append(p.Warnings, Warning{Kind: UnreportedConfig, Topic: name,
+					Message: fmt.Sprintf("the broker does not report config %s of this topic (it ignores or does not know the key): not set", key)})
+			case haveC.Sensitive:
 				p.Warnings = append(p.Warnings, Warning{Kind: SensitiveConfig, Topic: name,
 					Message: fmt.Sprintf("config %s is sensitive on the broker: its value cannot be compared, so it is not set", key)})
-			case known && haveC.Value == wantV:
+			case SameValue(haveC.Value, wantV):
 			default:
-				ch := ConfigChange{Key: key, To: wantV, FromSource: "absent"}
-				if known {
-					ch.From, ch.FromSource = haveC.Value, sourceName(haveC.Source)
-				}
-				changes = append(changes, ch)
+				changes = append(changes, ConfigChange{Key: key, To: wantV, From: haveC.Value, FromSource: sourceName(haveC.Source)})
 			}
 		}
 		if len(changes) > 0 {
@@ -298,6 +300,31 @@ func (p *Plan) Text() string {
 	fmt.Fprintf(&b, "cluster %s, spec %.12s: %d desired, %d observed; %d to create, %d to alter, %d to repartition, %d to delete, %d unchanged, %d warnings\n",
 		p.Cluster, p.Hash, p.Desired, p.Observed, p.Count(Create), p.Count(AlterConfigs), p.Count(AddPartitions), p.Count(Delete), p.Unchanged, len(p.Warnings))
 	return b.String()
+}
+
+// SameValue reports whether a value the broker reports means the desired one. Brokers normalize what they store:
+// booleans in lower case (Kafka reports "False" as "false"), list values in their own order (Redpanda reports
+// cleanup.policy "delete,compact" as "compact,delete"). Comparing the strings as given would plan the same change on
+// every run and never converge.
+func SameValue(have, want string) bool {
+	if have == want {
+		return true
+	}
+	if b1, b2 := strings.ToLower(have), strings.ToLower(want); (b1 == "true" || b1 == "false") && b1 == b2 {
+		return true
+	}
+	if strings.Contains(have, ",") || strings.Contains(want, ",") {
+		set := func(v string) string {
+			parts := strings.Split(v, ",")
+			for i := range parts {
+				parts[i] = strings.TrimSpace(parts[i])
+			}
+			sort.Strings(parts)
+			return strings.Join(parts, ",")
+		}
+		return set(have) == set(want)
+	}
+	return false
 }
 
 func sourceName(s cluster.Source) string {

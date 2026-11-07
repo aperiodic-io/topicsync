@@ -303,15 +303,19 @@ func TestPruneOnlyWithBothOptInsAndWithinItsCaps(t *testing.T) {
 	if !got["brrrrr.leases"] || !got["someone.elses"] || !got["raw.trades.binance-futures"] {
 		t.Error("prune deleted a protected, unmatched or listed topic")
 	}
-	// a truncated file: refused by the caps, nothing deleted
+	// a truncated file: refused by the caps, nothing deleted (the exact set, not a count)
+	before := topics(t, adm)
 	short := liveIngestionLike(true)
 	short.Topics = short.Topics[:3]
 	r := run(t, bin, nil, "apply", "--spec", writeSpec(t, short), "--brokers", b.Brokers(), "--prune").expect(t, 1)
 	if !strings.Contains(r.stderr, "refusing to prune") {
 		t.Errorf("%s", r.stderr)
 	}
-	if len(topics(t, adm)) < 37 {
-		t.Error("the refused prune deleted topics")
+	after := topics(t, adm)
+	for n := range before {
+		if !after[n] {
+			t.Errorf("the refused prune deleted %s", n)
+		}
 	}
 }
 

@@ -68,7 +68,7 @@ func TestObserveReportsTopicsConfigsAndTheirSources(t *testing.T) {
 		Configs: map[string]string{"retention.ms": "3600000", "cleanup.policy": "delete"}}); err != nil {
 		t.Fatal(err)
 	}
-	s, err := c.Observe(ctx(t))
+	s, err := c.Observe(ctx(t), []string{"obs.a"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +122,7 @@ func TestApplyChangesOnlyTheNamedKeys(t *testing.T) {
 	if out.Result.Executed[plan.AlterConfigs] != 1 {
 		t.Fatalf("result %+v", out.Result)
 	}
-	s, _ := c.Observe(ctx(t))
+	s, _ := c.Observe(ctx(t), []string{"keys"})
 	k := s.Topics["keys"]
 	if k.Configs["retention.ms"].Value != "7200000" {
 		t.Errorf("retention.ms %+v", k.Configs["retention.ms"])
@@ -142,8 +142,12 @@ func TestPartitionsGrowAndCannotShrink(t *testing.T) {
 	if err != nil || out.Result.Executed[plan.AddPartitions] != 1 {
 		t.Fatalf("%v %+v", err, out.Result)
 	}
-	if err := c.SetPartitions(ctx(t), "parts", 3); err == nil {
-		t.Error("the broker lowered a partition count")
+	// a count at or below the current one is "done" (a retried increase); it never lowers anything
+	if err := c.SetPartitions(ctx(t), "parts", 3); err != nil {
+		t.Errorf("SetPartitions below the current count: %v", err)
+	}
+	if s, _ := c.Observe(ctx(t), nil); s.Topics["parts"].Partitions != 5 {
+		t.Errorf("partitions %d after a lower SetPartitions, want 5", s.Topics["parts"].Partitions)
 	}
 	p, err := apply.Run(ctx(t), c, desired(t, 1, spec.Topic{Name: "parts", Partitions: 4}), plan.DefaultOptions(), eopts(), false)
 	if err != nil || !p.Plan.Empty() || p.Plan.WarningCount(plan.PartitionsAboveDesired) != 1 {
@@ -171,7 +175,11 @@ func TestManyTopicsArePacedConvergeAndAreIdempotent(t *testing.T) {
 		t.Fatalf("created %d, final %s", out.Result.Executed[plan.Create], out.Final.Text())
 	}
 	t.Logf("150 topics in %s", time.Since(start))
-	ready, err := c.LeadersReady(ctx(t), d.Names())
+	want := map[string]int32{}
+	for _, n := range d.Names() {
+		want[n] = 1
+	}
+	ready, err := c.LeadersReady(ctx(t), want)
 	if err != nil || !ready {
 		t.Errorf("leaders ready %v %v", ready, err)
 	}
@@ -214,7 +222,7 @@ func TestABrokerRefusalFailsThatTopicOnly(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "create bad") {
 		t.Fatalf("err %v", err)
 	}
-	s, _ := c.Observe(ctx(t))
+	s, _ := c.Observe(ctx(t), nil)
 	if _, ok := s.Topics["good"]; !ok {
 		t.Error("the good topic was not created")
 	}
@@ -330,7 +338,7 @@ func TestGroupUsesSeeMembersAndLag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("retire of a topic read to the end, nobody on it: %v", err)
 	}
-	s, _ := c.Observe(ctx(t))
+	s, _ := c.Observe(ctx(t), nil)
 	if _, ok := s.Topics["grp"]; ok {
 		t.Error("grp still exists after retire")
 	}
@@ -359,7 +367,7 @@ func TestPruneDeletesOnRealBrokers(t *testing.T) {
 	if err != nil || out.Result.Executed[plan.Delete] != 2 {
 		t.Fatalf("%v %+v", err, out.Result)
 	}
-	s, _ := c.Observe(ctx(t))
+	s, _ := c.Observe(ctx(t), nil)
 	for _, n := range []string{"m.v1.x.10", "m.v1.x.11"} {
 		if _, ok := s.Topics[n]; ok {
 			t.Errorf("%s survived the prune", n)
@@ -370,36 +378,10 @@ func TestPruneDeletesOnRealBrokers(t *testing.T) {
 	}
 }
 
-// Regression: kadm's Metadata answers from franz-go's metadata cache, which listed no topic at all after a request the
-// broker refused (INVALID_REQUEST on lowering partitions): every listed topic then looked missing. The adapter asks
-// the broker directly.
-func TestObserveStaysTruthfulAfterABrokerRefusal(t *testing.T) {
-	b := testbroker.Start(t)
-	c := connect(t, b)
-	if err := c.CreateTopic(ctx(t), spec.DesiredTopic{Name: "truth", Partitions: 2, ReplicationFactor: 1}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := apply.Run(ctx(t), c, desired(t, 1, spec.Topic{Name: "truth", Partitions: 5}), plan.DefaultOptions(), eopts(), false); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.SetPartitions(ctx(t), "truth", 3); err == nil {
-		t.Fatal("the broker lowered partitions")
-	}
-	for i := range 3 {
-		s, err := c.Observe(ctx(t))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, ok := s.Topics["truth"]; !ok {
-			t.Fatalf("observation %d after the refusal lists %d topics, without truth", i, len(s.Topics))
-		}
-	}
-}
-
 func TestLeadersReadyForAnUnknownTopicIsFalse(t *testing.T) {
 	b := testbroker.Start(t)
 	c := connect(t, b)
-	ready, err := c.LeadersReady(ctx(t), []string{"does.not.exist"})
+	ready, err := c.LeadersReady(ctx(t), map[string]int32{"does.not.exist": 1})
 	if err != nil || ready {
 		t.Fatalf("ready %v err %v", ready, err)
 	}
@@ -411,8 +393,48 @@ func TestUnreachableBrokersAreARetriableFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	_, err = c.Observe(ctx(t))
+	_, err = c.Observe(ctx(t), nil)
 	if err == nil || !cluster.IsRetriable(err) {
 		t.Fatalf("observe of a closed port: %v (retriable %v)", err, cluster.IsRetriable(err))
+	}
+}
+
+// A partition increase whose answer was lost and is retried: brokers refuse the now-equal count (INVALID_PARTITIONS),
+// which must count as done, not fail a converged run.
+func TestARetriedPartitionIncreaseIsDone(t *testing.T) {
+	b := testbroker.Start(t)
+	c := connect(t, b)
+	if err := c.CreateTopic(ctx(t), spec.DesiredTopic{Name: "again", Partitions: 1, ReplicationFactor: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetPartitions(ctx(t), "again", 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetPartitions(ctx(t), "again", 3); err != nil {
+		t.Fatalf("the retry of a done increase: %v", err)
+	}
+	if err := c.SetPartitions(ctx(t), "again", 2); err != nil {
+		t.Fatalf("an increase to fewer than there are is done too (the plan never asks for it): %v", err)
+	}
+}
+
+// Retire's write check against a real broker: a record appended during the check refuses it.
+func TestEndOffsetsSeeAppends(t *testing.T) {
+	b := testbroker.Start(t)
+	c := connect(t, b)
+	if err := c.CreateTopic(ctx(t), spec.DesiredTopic{Name: "ends", Partitions: 2, ReplicationFactor: 1}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := c.EndOffsets(ctx(t), "ends")
+	if err != nil || len(before) != 2 {
+		t.Fatalf("%v %v", before, err)
+	}
+	produce(t, b, "ends", 4, time.Now())
+	after, err := c.EndOffsets(ctx(t), "ends")
+	if err != nil || after[0]+after[1] != before[0]+before[1]+4 {
+		t.Fatalf("before %v after %v err %v", before, after, err)
+	}
+	if _, err := c.EndOffsets(ctx(t), "no.such.topic"); err == nil {
+		t.Error("end offsets of a missing topic")
 	}
 }
