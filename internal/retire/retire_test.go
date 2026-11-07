@@ -194,3 +194,33 @@ func TestEndOffsetErrorsDuringTheWriteCheckAreErrors(t *testing.T) {
 		t.Fatalf("an end-offset error let it through: %v", err)
 	}
 }
+
+func TestWriteCheckEdgeCases(t *testing.T) {
+	// a partition added during the check, and the default (real) sleep
+	f, d := setup(t)
+	f.Ends["old.topic"] = []map[int32]int64{{0: 5}, {0: 5, 1: 0}}
+	opts := Options{Confirm: "old.topic", MinIdle: time.Hour, WriteCheck: time.Millisecond, Now: func() time.Time { return now }}
+	_, err := Retire(context.Background(), f, d, "old.topic", opts)
+	refusal(t, err, "partition count changed from 1 to 2")
+
+	// the second read fails
+	f, d = setup(t)
+	f.Ends["old.topic"] = []map[int32]int64{{0: 5}}
+	opts.Sleep = func(context.Context, time.Duration) error {
+		f.FailOn["ends:old.topic"] = errors.New("NOT_LEADER")
+		return nil
+	}
+	if _, err := Retire(context.Background(), f, d, "old.topic", opts); err == nil || !f.Has("old.topic") {
+		t.Fatalf("second end-offset read failing: %v", err)
+	}
+
+	// cancelled while waiting
+	f, d = setup(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	opts.Sleep = nil
+	opts.WriteCheck = time.Hour
+	go cancel()
+	if _, err := Retire(ctx, f, d, "old.topic", opts); !errors.Is(err, context.Canceled) || !f.Has("old.topic") {
+		t.Fatalf("cancelled during the check: %v", err)
+	}
+}

@@ -367,7 +367,18 @@ func TestPruneDeletesOnRealBrokers(t *testing.T) {
 	if err != nil || out.Result.Executed[plan.Delete] != 2 {
 		t.Fatalf("%v %+v", err, out.Result)
 	}
-	s, _ := c.Observe(ctx(t), nil)
+	// Kafka deletes asynchronously: a deleted topic can be listed for a moment after its delete succeeded
+	var s cluster.State
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		s, _ = c.Observe(ctx(t), nil)
+		_, a := s.Topics["m.v1.x.10"]
+		_, b := s.Topics["m.v1.x.11"]
+		if (!a && !b) || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Second)
+	}
 	for _, n := range []string{"m.v1.x.10", "m.v1.x.11"} {
 		if _, ok := s.Topics[n]; ok {
 			t.Errorf("%s survived the prune", n)

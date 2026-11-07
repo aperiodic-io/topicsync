@@ -238,3 +238,36 @@ func TestPerTopicSeriesOnlyForDriftAndCapped(t *testing.T) {
 		t.Error("truncation not reported")
 	}
 }
+
+func TestRedactionAndUnwrapping(t *testing.T) {
+	if got := redact("http://u:p@h/x"); strings.Contains(got, "p@") && !strings.Contains(got, "xxxxx") {
+		t.Errorf("redact %q", got)
+	}
+	if got := redact("http://[::1"); got != "(an unparseable URL)" {
+		t.Errorf("redact of a bad URL: %q", got)
+	}
+	plain := io.EOF
+	if unwrapURLError(plain) != plain {
+		t.Error("unwrap changed a non-URL error")
+	}
+}
+
+func TestWriteFileFailsWhenItCannotRename(t *testing.T) {
+	dir := t.TempDir()
+	target := dir + "/is-a-dir"
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target+"/x", []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteFile(target, "a 1\n"); err == nil {
+		t.Error("renaming over a non-empty directory succeeded")
+	}
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".topicsync-") {
+			t.Errorf("leftover temporary file %s", e.Name())
+		}
+	}
+}
