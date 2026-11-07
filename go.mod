@@ -2,6 +2,8 @@ module github.com/aperiodic-io/topicsync
 
 go 1.26.2
 
+toolchain go1.26.10
+
 require (
 	github.com/twmb/franz-go v1.22.2
 	github.com/twmb/franz-go/pkg/kadm v1.19.0

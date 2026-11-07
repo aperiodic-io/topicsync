@@ -112,7 +112,7 @@ func writeSpec(t *testing.T, f spec.File) string {
 		t.Fatal(err)
 	}
 	p := filepath.Join(t.TempDir(), "topics.json")
-	if err := os.WriteFile(p, b, 0o600); err != nil {
+	if err := os.WriteFile(p, b, 0o644); err != nil { // readable by the image's non-root user
 		t.Fatal(err)
 	}
 	return p

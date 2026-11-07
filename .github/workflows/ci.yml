@@ -12,6 +12,8 @@ concurrency:
 permissions: { contents: read }
 env:
   GOFLAGS: -mod=readonly
+  # go.mod's toolchain; the go directive stays lower so that importers of spec are not forced up
+  GO_VERSION: "1.26.10"
   REDPANDA_CURRENT: docker.redpanda.com/redpandadata/redpanda:v26.1.6
   REDPANDA_NEXT: docker.redpanda.com/redpandadata/redpanda:v26.2.1
 
@@ -21,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version-file: go.mod }
+        with: { go-version: "${{ env.GO_VERSION }}" }
       - name: go mod tidy leaves nothing to change
         run: go mod tidy && git diff --exit-code go.mod go.sum
       - uses: golangci/golangci-lint-action@v8
@@ -36,7 +38,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version-file: go.mod }
+        with: { go-version: "${{ env.GO_VERSION }}" }
       - run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./internal/... ./spec/... ./cmd/...
       # the logic packages are held to 90%: the kafka adapter and the broker helper are covered by the integration
       # and acceptance jobs instead
@@ -56,7 +58,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version-file: go.mod }
+        with: { go-version: "${{ env.GO_VERSION }}" }
       - run: go test -run '^$' -fuzz FuzzParse -fuzztime 90s ./spec/
 
   integration:
@@ -73,7 +75,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version-file: go.mod }
+        with: { go-version: "${{ env.GO_VERSION }}" }
       - run: docker pull -q "${{ matrix.image }}"
       - run: go test -tags integration -count=1 -p 1 -timeout 30m -v ./test/integration/ 2>&1 | tee integration.log
         env:
@@ -83,9 +85,14 @@ jobs:
           TOPICSYNC_IT_UPGRADE_TO: ${{ matrix.upgrade && env.REDPANDA_NEXT || '' }}
       - name: no test may be skipped but the ones of another broker
         run: |
-          set -o pipefail
-          if grep -E -- '--- SKIP' integration.log | grep -vE 'Redpanda only|TOPICSYNC_IT_UPGRADE'; then exit 1; fi
-          if [ "${{ matrix.upgrade }}" = "true" ] && grep -q -- '--- SKIP: TestARedpandaUpgrade' integration.log; then exit 1; fi
+          allowed="TestARedpandaUpgradeLeavesNothingToChange"
+          [ "${{ matrix.flavor }}" = kafka ] && allowed="$allowed TestThreeBrokersReplicationThreeAndAStalledBroker"
+          [ "${{ matrix.upgrade }}" = true ] && allowed=""
+          bad=0
+          for t in $(grep -oE -- '--- SKIP: [A-Za-z0-9_]+' integration.log | awk '{print $3}'); do
+            case " $allowed " in *" $t "*) echo "skipped as expected: $t" ;; *) echo "::error::unexpected skip: $t"; bad=1 ;; esac
+          done
+          exit $bad
 
   acceptance:
     runs-on: ubuntu-latest
@@ -97,7 +104,7 @@ jobs:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
       - uses: actions/setup-go@v5
-        with: { go-version-file: go.mod }
+        with: { go-version: "${{ env.GO_VERSION }}" }
       # the previous build: the pull request's base, the commit before a push to main, the tag before a release
       - name: build the previous topicsync
         id: prev
@@ -125,7 +132,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version-file: go.mod }
+        with: { go-version: "${{ env.GO_VERSION }}" }
       - uses: docker/setup-buildx-action@v3
       - name: build
         uses: docker/build-push-action@v6
@@ -166,7 +173,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version-file: go.mod }
+        with: { go-version: "${{ env.GO_VERSION }}" }
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
