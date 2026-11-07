@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -247,7 +248,7 @@ func TestRedactionAndUnwrapping(t *testing.T) {
 		t.Errorf("redact of a bad URL: %q", got)
 	}
 	plain := io.EOF
-	if unwrapURLError(plain) != plain {
+	if got := unwrapURLError(plain); !errors.Is(got, plain) || got.Error() != plain.Error() {
 		t.Error("unwrap changed a non-URL error")
 	}
 }
