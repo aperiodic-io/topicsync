@@ -121,6 +121,24 @@ func writeSpec(t *testing.T, f spec.File) string {
 // currentBrokers is the running test's broker list (tests run one at a time).
 var currentBrokers []string
 
+// topicsAfterDeletes lists the topics once the given ones are gone, or after 30 s: Kafka deletes asynchronously, so a
+// deleted topic can still be listed right after its delete succeeded.
+func topicsAfterDeletes(t *testing.T, adm *kadm.Client, gone ...string) map[string]bool {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		got := topics(t, adm)
+		left := false
+		for _, g := range gone {
+			left = left || got[g]
+		}
+		if !left || time.Now().After(deadline) {
+			return got
+		}
+		time.Sleep(time.Second)
+	}
+}
+
 func admin(t *testing.T, b *testbroker.Cluster) *kadm.Client {
 	currentBrokers = b.Addrs
 	return b.Admin()
@@ -296,7 +314,7 @@ func TestPruneOnlyWithBothOptInsAndWithinItsCaps(t *testing.T) {
 	noprune := writeSpec(t, liveIngestionLike(false))
 	run(t, bin, nil, "apply", "--spec", noprune, "--brokers", b.Brokers(), "--prune").expect(t, 1)
 	run(t, bin, nil, "apply", "--spec", p, "--brokers", b.Brokers(), "--prune").expect(t, 0)
-	got := topics(t, adm)
+	got := topicsAfterDeletes(t, adm, "ohlcv.v1.old-exchange.1m", "ohlcv.v1.old-exchange.1h")
 	if got["ohlcv.v1.old-exchange.1m"] || got["ohlcv.v1.old-exchange.1h"] {
 		t.Error("stale topics survived the prune")
 	}
@@ -352,7 +370,7 @@ func TestRetireEndToEnd(t *testing.T) {
 		t.Fatalf("the dry run: %s", r.stdout)
 	}
 	run(t, bin, nil, "retire", "--spec", p, "--brokers", b.Brokers(), "--topic", gone.Name, "--confirm", gone.Name).expect(t, 0)
-	if topics(t, adm)[gone.Name] {
+	if topicsAfterDeletes(t, adm, gone.Name)[gone.Name] {
 		t.Fatal("retired topic still there")
 	}
 }
