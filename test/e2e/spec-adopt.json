@@ -1,0 +1,11 @@
+{
+  "apiVersion": "topicsync.aperiodic.io/v1",
+  "cluster": "e2e",
+  "defaults": {"partitions": 1, "replicationFactor": 1, "configs": {"cleanup.policy": "delete"}},
+  "topics": [
+    {"name": "ohlcv.v1.e2e.1m", "configs": {"retention.bytes": "40316198", "segment.bytes": "16777216"}},
+    {"name": "ohlcv.v1.e2e.1h", "configs": {"retention.bytes": "40316199", "segment.bytes": "16777216"}},
+    {"name": "raw.trades.e2e", "partitions": 3, "configs": {"retention.bytes": "1879048192"}}
+  ],
+  "prune": {"enabled": false}
+}

@@ -1,0 +1,4 @@
+/topicsync
+*.test
+coverage.*
+/dist/

@@ -1,0 +1,38 @@
+# A single-broker Redpanda for the end-to-end test (dev-container mode), reachable in the cluster as
+# redpanda-0.redpanda.redpanda.svc.cluster.local:9092.
+apiVersion: v1
+kind: Service
+metadata: {name: redpanda, namespace: redpanda}
+spec:
+  clusterIP: None
+  selector: {app: redpanda}
+  ports: [{name: kafka, port: 9092}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: redpanda, namespace: redpanda}
+spec:
+  serviceName: redpanda
+  replicas: 1
+  selector: {matchLabels: {app: redpanda}}
+  template:
+    metadata: {labels: {app: redpanda}}
+    spec:
+      containers:
+        - name: redpanda
+          image: REDPANDA_IMAGE
+          args:
+            - redpanda
+            - start
+            - --mode=dev-container
+            - --smp=1
+            - --memory=1G
+            - --overprovisioned
+            - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+            - --advertise-kafka-addr=PLAINTEXT://redpanda-0.redpanda.redpanda.svc.cluster.local:9092
+            - --set
+            - redpanda.auto_create_topics_enabled=false
+          ports: [{containerPort: 9092, name: kafka}]
+          readinessProbe:
+            exec: {command: [rpk, cluster, health, --exit-when-healthy]}
+            periodSeconds: 5
